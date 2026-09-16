@@ -21,6 +21,12 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from urllib.parse import quote
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import textwrap
+
 app = Flask(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -752,6 +758,149 @@ def generate_pwa_icons():
 
 
 # =====================================================================
+#  CHART GENERATION
+# =====================================================================
+CHART_KEYWORDS = [
+    "graphique", "chart", "graph", "diagramme", "courbe",
+    "histogramme", "camembert", "barres", "courbe",
+    "visualisation", "stats", "statistiques",
+]
+
+
+def is_chart_request(message):
+    msg = message.lower().strip()
+    return any(kw in msg for kw in CHART_KEYWORDS)
+
+
+def generate_chart(prompt):
+    try:
+        prompt_lower = prompt.lower()
+        plt.style.use('dark_background')
+        fig, ax = plt.subplots(figsize=(8, 5))
+        fig.patch.set_facecolor('#0f0f15')
+        ax.set_facecolor('#0f0f15')
+
+        if any(w in prompt_lower for w in ["camembert", "pie", "cercle"]):
+            labels = ['Produits A', 'Produits B', 'Produits C', 'Produits D', 'Autres']
+            sizes = [35, 25, 20, 12, 8]
+            colors = ['#6366f1', '#a855f7', '#3b82f6', '#22c55e', '#f97316']
+            explode = (0.05, 0.05, 0.05, 0.05, 0.05)
+            wedges, texts, autotexts = ax.pie(
+                sizes, labels=labels, autopct='%1.1f%%',
+                startangle=90, colors=colors, explode=explode,
+                textprops={'color': 'white', 'fontsize': 11}
+            )
+            for t in autotexts:
+                t.set_fontsize(10)
+            ax.set_title('Repartition des donnees', color='white', fontsize=14, fontweight='bold')
+        elif any(w in prompt_lower for w in ["courbe", "line", "tendance", "evolution"]):
+            months = ['Jan', 'Fev', 'Mar', 'Avr', 'Mai', 'Jun', 'Jul', 'Aou', 'Sep', 'Oct', 'Nov', 'Dec']
+            data = [45, 62, 55, 78, 82, 91, 87, 95, 88, 102, 110, 118]
+            ax.plot(months, data, color='#6366f1', linewidth=2.5, marker='o', markersize=6, markerfacecolor='#a855f7')
+            ax.fill_between(range(len(months)), data, alpha=0.15, color='#6366f1')
+            ax.set_title('Evolution temporelle', color='white', fontsize=14, fontweight='bold')
+            ax.set_ylabel('Valeur', color='#8888aa', fontsize=11)
+            ax.tick_params(colors='#8888aa')
+            ax.grid(True, alpha=0.2, color='#333355')
+        else:
+            categories = ['Ventes\nQ1', 'Ventes\nQ2', 'Ventes\nQ3', 'Ventes\nQ4']
+            values = [234, 312, 278, 395]
+            colors_bar = ['#6366f1', '#a855f7', '#3b82f6', '#22c55e']
+            bars = ax.bar(categories, values, color=colors_bar, width=0.6, edgecolor='none')
+            for bar, val in zip(bars, values):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 8,
+                        str(val), ha='center', va='bottom', color='white', fontweight='bold', fontsize=12)
+            ax.set_title('Diagramme en barres', color='white', fontsize=14, fontweight='bold')
+            ax.set_ylabel('Valeur', color='#8888aa', fontsize=11)
+            ax.tick_params(colors='#8888aa')
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.spines['left'].set_color('#333355')
+            ax.spines['bottom'].set_color('#333355')
+            ax.grid(True, axis='y', alpha=0.15, color='#333355')
+
+        plt.tight_layout()
+        filename = f"chart_{int(time.time())}.png"
+        filepath = os.path.join(GENERATED_DIR, filename)
+        fig.savefig(filepath, dpi=150, facecolor=fig.get_facecolor(), edgecolor='none', bbox_inches='tight')
+        plt.close(fig)
+        return f"/generated/{filename}"
+    except Exception as e:
+        print(f"Chart error: {e}")
+        plt.close('all')
+        return None
+
+
+# =====================================================================
+#  PDF / DOCUMENT ANALYSIS
+# =====================================================================
+def extract_pdf_text(pdf_bytes):
+    try:
+        import pdfplumber
+        text_parts = []
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    text_parts.append(t)
+        return "\n\n".join(text_parts)
+    except ImportError:
+        pass
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(BytesIO(pdf_bytes))
+        text_parts = []
+        for page in reader.pages:
+            t = page.extract_text()
+            if t:
+                text_parts.append(t)
+        return "\n\n".join(text_parts)
+    except ImportError:
+        pass
+    return None
+
+
+def analyze_document_b64(data_url):
+    try:
+        if "," in data_url:
+            header, b64data = data_url.split(",", 1)
+        else:
+            b64data = data_url
+        pdf_bytes = base64.b64decode(b64data)
+        text = extract_pdf_text(pdf_bytes)
+        if not text:
+            return None, "Impossible d'extraire le texte du PDF."
+        preview = text[:3000]
+        summary = None
+        for model in CHAT_MODELS:
+            try:
+                r = _requests.post(
+                    CHAT_API_KILOCODE,
+                    json={
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": "Tu es un assistant expert en analyse de documents. Resume et analyse le texte suivant en francais."},
+                            {"role": "user", "content": f"Analyse et resume ce document:\n\n{preview}"},
+                        ],
+                        "max_tokens": 800,
+                        "temperature": 0.5,
+                    },
+                    timeout=30,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    if "choices" in data and data["choices"]:
+                        summary = data["choices"][0].get("message", {}).get("content", "")
+                        if summary and len(summary.strip()) > 20:
+                            break
+            except Exception:
+                continue
+        return text, summary
+    except Exception as e:
+        return None, f"Erreur: {str(e)}"
+
+
+# =====================================================================
 #  HTML TEMPLATE
 # =====================================================================
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -956,6 +1105,52 @@ textarea.tool-input{min-height:200px;resize:vertical;font-family:"Fira Code",Con
 .install-btn{padding:6px 12px;background:linear-gradient(135deg,var(--gn),var(--cy));color:#fff;border:none;border-radius:var(--r);cursor:pointer;font-size:12px;font-weight:600;display:none;align-items:center;gap:4px}
 .install-btn:hover{transform:scale(1.05)}
 
+/* PARTICLES CANVAS */
+#particlesCanvas{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;pointer-events:none;opacity:.6}
+
+/* SVG AVATAR */
+.avatar-svg-wrap{width:120px;height:120px;position:relative}
+.avatar-svg-wrap.header-avatar{width:36px;height:36px}
+.avatar-svg{width:100%;height:100%}
+.avatar-float{animation:avatarFloat 4s ease-in-out infinite}
+@keyframes avatarFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+.avatar-eye{transition:all .3s}
+.avatar-thinking .avatar-eye{animation:avatarThinkEye 1.5s ease-in-out infinite}
+@keyframes avatarThinkEye{0%,100%{transform:translateY(0)}50%{transform:translateY(-4px)}}
+.avatar-speaking .avatar-mouth{animation:avatarSpeakMouth .3s ease-in-out infinite alternate}
+@keyframes avatarSpeakMouth{0%{ry:4}100%{ry:8}}
+.avatar-glow{filter:drop-shadow(0 0 8px rgba(99,102,241,.6));transition:filter .5s}
+.avatar-glow-active{filter:drop-shadow(0 0 20px rgba(99,102,241,.9)) drop-shadow(0 0 40px rgba(168,85,247,.4))}
+.avatar-gear{transform-origin:center;opacity:0;transition:opacity .3s}
+.avatar-thinking .avatar-gear{opacity:1;animation:gearSpin 2s linear infinite}
+@keyframes gearSpin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+.avatar-wave-arc{opacity:0;transition:opacity .3s}
+.avatar-listening .avatar-wave-arc{opacity:1;animation:waveArc 1.2s ease-in-out infinite}
+@keyframes waveArc{0%,100%{opacity:.3;transform:scale(.9)}50%{opacity:.8;transform:scale(1.1)}}
+
+/* TYPEWRITER */
+.typewriter-cursor{display:inline-block;width:2px;height:1em;background:var(--ac);margin-left:2px;animation:blink .8s step-end infinite;vertical-align:text-bottom}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+.typewriter-done .typewriter-cursor{display:none}
+
+/* TRANSITIONS */
+.view-transition{animation:viewFadeIn .35s ease}
+@keyframes viewFadeIn{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+
+/* PULSE BTN */
+.pulse-active{animation:pulseBtn 1.5s ease-in-out infinite}
+@keyframes pulseBtn{0%,100%{box-shadow:0 0 0 0 rgba(99,102,241,.5)}50%{box-shadow:0 0 0 10px rgba(99,102,241,0)}}
+
+/* CHART MSG */
+.chart-msg-img{max-width:100%;border-radius:var(--r);border:1px solid var(--bd);margin:8px 0;cursor:pointer;transition:transform .2s}
+.chart-msg-img:hover{transform:scale(1.02)}
+
+/* DOC MSG */
+.doc-badge{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:10px;font-size:10px;font-weight:600;margin-top:6px;background:rgba(249,115,22,.15);color:var(--or);border:1px solid rgba(249,115,22,.25)}
+.doc-preview{font-size:12px;color:var(--txd);max-height:200px;overflow-y:auto;padding:10px;background:var(--bgh);border:1px solid var(--bd);border-radius:var(--r);margin-top:8px;font-family:"Fira Code",monospace;line-height:1.5;white-space:pre-wrap}
+.doc-upload-btn{position:relative;overflow:hidden}
+.doc-upload-btn input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer}
+
 @media(max-width:768px){
   .sidebar{transform:translateX(-100%)}
   .sidebar.open{transform:translateX(0)}
@@ -967,11 +1162,25 @@ textarea.tool-input{min-height:200px;resize:vertical;font-family:"Fira Code",Con
 </style>
 </head>
 <body>
+<canvas id="particlesCanvas"></canvas>
 
 <aside class="sidebar" id="sidebar">
   <div class="sidebar-header">
     <div class="logo">
-      <div class="logo-icon glow-animate">E</div>
+      <div class="logo-icon glow-animate avatar-float" id="sidebarAvatar">
+        <svg viewBox="0 0 100 100" class="avatar-svg">
+          <defs><linearGradient id="avatarGrad" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" style="stop-color:#818cf8"/><stop offset="100%" style="stop-color:#c084fc"/></linearGradient></defs>
+          <circle cx="50" cy="52" r="34" fill="url(#avatarGrad)" opacity=".15" stroke="#818cf8" stroke-width="2"/>
+          <circle cx="37" cy="46" r="7" fill="#818cf8" class="avatar-eye"><animate attributeName="r" values="7;7;6;7" dur="3s" repeatCount="indefinite"/></circle>
+          <circle cx="63" cy="46" r="7" fill="#818cf8" class="avatar-eye"><animate attributeName="r" values="7;7;6;7" dur="3s" repeatCount="indefinite" begin=".5s"/></circle>
+          <circle cx="37" cy="46" r="3" fill="#0f0f15"/><circle cx="63" cy="46" r="3" fill="#0f0f15"/>
+          <ellipse cx="50" cy="64" rx="10" ry="4" fill="none" stroke="#818cf8" stroke-width="2" stroke-linecap="round"/>
+          <line x1="50" y1="18" x2="50" y2="10" stroke="#818cf8" stroke-width="2" stroke-linecap="round"/>
+          <circle cx="50" cy="8" r="3" fill="#a855f7"/>
+          <circle cx="28" cy="58" r="2" fill="#6366f1" opacity=".5"/>
+          <circle cx="72" cy="58" r="2" fill="#6366f1" opacity=".5"/>
+        </svg>
+      </div>
       <div><div class="logo-text">ELLIOTT</div><div class="logo-sub">IA Ultime</div></div>
     </div>
   </div>
@@ -1064,8 +1273,18 @@ textarea.tool-input{min-height:200px;resize:vertical;font-family:"Fira Code",Con
 
   <div class="chat" id="chatMessages">
     <div class="welcome" id="welcomeScreen">
-      <div class="welcome-icon glow-animate">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+      <div class="welcome-icon glow-animate avatar-glow" id="welcomeAvatar">
+        <svg viewBox="0 0 100 100" class="avatar-svg">
+          <defs><linearGradient id="wAvatarGrad" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" style="stop-color:#fff"/><stop offset="100%" style="stop-color:#c084fc"/></linearGradient></defs>
+          <circle cx="50" cy="52" r="34" fill="url(#wAvatarGrad)" opacity=".15" stroke="#fff" stroke-width="2"/>
+          <circle cx="37" cy="46" r="7" fill="#fff" class="avatar-eye"><animate attributeName="r" values="7;7;6;7" dur="3s" repeatCount="indefinite"/></circle>
+          <circle cx="63" cy="46" r="7" fill="#fff" class="avatar-eye"><animate attributeName="r" values="7;7;6;7" dur="3s" repeatCount="indefinite" begin=".5s"/></circle>
+          <circle cx="37" cy="46" r="3" fill="#0f0f15"/><circle cx="63" cy="46" r="3" fill="#0f0f15"/>
+          <ellipse cx="50" cy="64" rx="10" ry="4" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"/>
+          <line x1="50" y1="18" x2="50" y2="10" stroke="#fff" stroke-width="2" stroke-linecap="round"/>
+          <circle cx="50" cy="8" r="3" fill="#fff" opacity=".8"/>
+          <g class="avatar-gear"><circle cx="18" cy="32" r="5" fill="none" stroke="#a855f7" stroke-width="1.5" stroke-dasharray="3 2"><animateTransform attributeName="transform" type="rotate" from="0 18 32" to="360 18 32" dur="3s" repeatCount="indefinite"/></circle></g>
+        </svg>
       </div>
       <h2>Bonjour! Je suis ELLIOTT</h2>
       <p>IA <strong>revolutionnaire</strong> qui apprend, retient et s'ameliore!</p>
@@ -1190,6 +1409,14 @@ textarea.tool-input{min-height:200px;resize:vertical;font-family:"Fira Code",Con
       <button class="action-btn" onclick="sendImage()" title="Generer image">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
       </button>
+      <label class="action-btn doc-upload-btn" title="Analyser un document">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+        <input type="file" accept=".pdf,.doc,.docx,.txt,.csv" onchange="handleDocUpload(event)" style="display:none">
+      </label>
+      <label class="action-btn" title="Uploader une image" style="cursor:pointer">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+        <input type="file" accept="image/*" onchange="handleChatImageUpload(event)" style="display:none">
+      </label>
       <button class="action-btn" onclick="showView('music',document.querySelectorAll('.menu-item')[3])" title="Generer musique">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
       </button>
@@ -1210,7 +1437,40 @@ textarea.tool-input{min-height:200px;resize:vertical;font-family:"Fira Code",Con
   </div>
   <div class="voice-body">
     <div class="voice-circle" id="voiceCircle" onclick="onVoiceCircleClick()">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="voice-icon"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+      <svg viewBox="0 0 100 100" class="avatar-svg avatar-float" id="voiceAvatar">
+        <defs>
+          <linearGradient id="vAvatarGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" style="stop-color:#818cf8"/><stop offset="100%" style="stop-color:#c084fc"/>
+          </linearGradient>
+          <filter id="avatarGlow"><feGaussianBlur stdDeviation="2" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+        </defs>
+        <circle cx="50" cy="52" r="34" fill="url(#vAvatarGrad)" opacity=".2" stroke="#818cf8" stroke-width="2.5" filter="url(#avatarGlow)"/>
+        <!-- Antenna -->
+        <line x1="50" y1="18" x2="50" y2="6" stroke="#818cf8" stroke-width="2.5" stroke-linecap="round"/>
+        <circle cx="50" cy="5" r="4" fill="#a855f7"><animate attributeName="r" values="4;5;4" dur="1.5s" repeatCount="indefinite"/></circle>
+        <!-- Eyes -->
+        <circle cx="37" cy="44" r="8" fill="#818cf8" class="avatar-eye" filter="url(#avatarGlow)"/>
+        <circle cx="63" cy="44" r="8" fill="#818cf8" class="avatar-eye" filter="url(#avatarGlow)"/>
+        <circle cx="37" cy="44" r="3.5" fill="#0f0f15" class="avatar-pupil"/>
+        <circle cx="63" cy="44" r="3.5" fill="#0f0f15" class="avatar-pupil"/>
+        <circle cx="35" cy="42" r="1.5" fill="#fff" opacity=".7"/>
+        <circle cx="61" cy="42" r="1.5" fill="#fff" opacity=".7"/>
+        <!-- Mouth -->
+        <ellipse cx="50" cy="65" rx="12" ry="4" fill="none" stroke="#818cf8" stroke-width="2.5" stroke-linecap="round" class="avatar-mouth"/>
+        <!-- Cheeks -->
+        <circle cx="26" cy="56" r="4" fill="#a855f7" opacity=".15"/>
+        <circle cx="74" cy="56" r="4" fill="#a855f7" opacity=".15"/>
+        <!-- Gears (thinking) -->
+        <g class="avatar-gear" transform="translate(14,28)">
+          <circle r="5" fill="none" stroke="#c084fc" stroke-width="1.5" stroke-dasharray="3 2"><animateTransform attributeName="transform" type="rotate" from="0 0 0" to="360 0 0" dur="2s" repeatCount="indefinite"/></circle>
+        </g>
+        <g class="avatar-gear" transform="translate(86,28)">
+          <circle r="4" fill="none" stroke="#c084fc" stroke-width="1.5" stroke-dasharray="2 2"><animateTransform attributeName="transform" type="rotate" from="360 0 0" to="0 0 0" dur="1.5s" repeatCount="indefinite"/></circle>
+        </g>
+        <!-- Sound waves (speaking) -->
+        <path d="M85 44 Q92 50 85 56" fill="none" stroke="#818cf8" stroke-width="2" stroke-linecap="round" class="avatar-wave-arc" opacity=".6"/>
+        <path d="M90 40 Q100 50 90 60" fill="none" stroke="#818cf8" stroke-width="1.5" stroke-linecap="round" class="avatar-wave-arc" opacity=".4" style="animation-delay:.3s"/>
+      </svg>
     </div>
     <div class="voice-status" id="voiceStatus">Appuyez pour parler</div>
     <div class="voice-text" id="voiceText"></div>
@@ -1278,6 +1538,8 @@ function updateVoiceUI(){
   c.className='voice-circle voice-'+voiceState;
   var labels={idle:'Appuyez pour parler',listening:'Je vous ecoute...',thinking:'Je reflechis...',speaking:'Je parle...'};
   s.textContent=labels[voiceState]||'';
+  setAvatarState(voiceState);
+  if(window.elliottParticles)window.elliottParticles.setSpeaking(voiceState==='speaking'||voiceState==='thinking');
 }
 
 function onVoiceCircleClick(){
@@ -1560,28 +1822,69 @@ function sendMessage(){
   synth.cancel();
   addMessage(msg,true);
   i.value='';
+  if(isChartRequest(msg)){
+    showTyping('Generation du graphique...');
+    setAvatarState('thinking');
+    if(window.elliottParticles)window.elliottParticles.setSpeaking(true);
+    fetch('/api/chart',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({prompt:msg})})
+    .then(function(r){return r.json()})
+    .then(function(d){
+      hideTyping();setAvatarState('idle');
+      if(window.elliottParticles)window.elliottParticles.setSpeaking(false);
+      if(d.chart_url){
+        var chat=document.getElementById('chatMessages');
+        var w=document.getElementById('welcomeScreen');
+        if(w)w.remove();
+        var m=document.createElement('div');m.className='message assistant view-transition';
+        m.id='msg_'+(++msgCount);
+        var av='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>';
+        var content='<img class="chart-msg-img" src="'+escapeHtml(d.chart_url)+'" alt="Graphique">';
+        if(d.text)content+='<div style="margin-top:8px">'+formatMarkdown(d.text)+'</div>';
+        content+='<div class="ai-badge">ELLIOTT IA - Graphique</div>';
+        m.innerHTML='<div class="message-avatar"><div style="width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--ac),var(--pp));display:flex;align-items:center;justify-content:center">'+av+'</div></div><div class="message-content">'+content+'</div>';
+        chat.appendChild(m);chat.scrollTop=chat.scrollHeight;
+      }else{
+        addMessage('Impossible de generer le graphique.',false);
+      }
+    })
+    .catch(function(){hideTyping();setAvatarState('idle');if(window.elliottParticles)window.elliottParticles.setSpeaking(false);addMessage('Erreur lors de la generation du graphique.',false);});
+    i.focus();
+    return;
+  }
   var isSearch=needsWebSearchMsg(msg);
   showTyping(isSearch?'Recherche sur le net...':'Reflexion...');
   document.getElementById('headerSubtitle').textContent=isSearch?'Recherche...':'En reflexion...';
+  setAvatarState('thinking');
+  if(window.elliottParticles)window.elliottParticles.setSpeaking(true);
   fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({message:msg,conversation_id:convId})})
   .then(function(r){return r.json()})
   .then(function(d){
     hideTyping();
+    setAvatarState('idle');
     document.getElementById('headerSubtitle').textContent='Pret a discuter';
     if(d.image_url){
       addImageMessage(d.image_url,d.image_prompt||'',d.text||'Image generee');
       if(autoSpeak&&d.text)speakText(d.text);
+      if(window.elliottParticles)window.elliottParticles.setSpeaking(false);
     }else if(d.music_url){
       addMusicMessage(d.music_url,d.music_prompt||msg);
+      if(window.elliottParticles)window.elliottParticles.setSpeaking(false);
     }else{
       var conf=typeof d.confidence==='number'?d.confidence:0.8;
-      addMessage(d.text||'Pas de reponse',false,{confidence:conf,searchUsed:d.search_used});
-      if(autoSpeak&&d.text)speakText(d.text);
+      setAvatarState('speaking');
+      addMessageWithTypewriter(d.text||'Pas de reponse',false,{confidence:conf,searchUsed:d.search_used});
+      if(autoSpeak&&d.text){
+        speakText(d.text);
+      }
+      setTimeout(function(){if(window.elliottParticles)window.elliottParticles.setSpeaking(false);},3000);
     }
   })
   .catch(function(){
     hideTyping();
+    setAvatarState('idle');
+    if(window.elliottParticles)window.elliottParticles.setSpeaking(false);
     document.getElementById('headerSubtitle').textContent='Pret a discuter';
     addMessage('Erreur de connexion. Verifiez internet.',false);
   });
@@ -1831,6 +2134,275 @@ function installPWA(){
   });
 }
 if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){});}
+
+// ============================================================
+// PARTICLES BACKGROUND
+// ============================================================
+(function(){
+  var c=document.getElementById('particlesCanvas');
+  if(!c)return;
+  var ctx=c.getContext('2d');
+  var particles=[];
+  var speaking=false;
+  var W,H;
+  var colors=['rgba(99,102,241,','rgba(168,85,247,','rgba(59,130,246,','rgba(139,92,246,'];
+
+  function resize(){W=c.width=window.innerWidth;H=c.height=window.innerHeight;}
+  resize();
+  window.addEventListener('resize',resize);
+
+  function initParticles(){
+    particles=[];
+    var count=Math.min(60,Math.floor(W*H/25000));
+    for(var i=0;i<count;i++){
+      particles.push({
+        x:Math.random()*W,y:Math.random()*H,
+        vx:(Math.random()-.5)*.3,vy:(Math.random()-.5)*.3,
+        r:Math.random()*2+1,
+        color:colors[Math.floor(Math.random()*colors.length)],
+        alpha:Math.random()*.3+.1
+      });
+    }
+  }
+  initParticles();
+
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    for(var i=0;i<particles.length;i++){
+      var p=particles[i];
+      if(speaking){
+        p.x+=p.vx*3;p.y+=p.vy*3;
+      }else{
+        p.x+=p.vx;p.y+=p.vy;
+      }
+      if(p.x<0)p.x=W;if(p.x>W)p.x=0;
+      if(p.y<0)p.y=H;if(p.y>H)p.y=0;
+      ctx.beginPath();
+      ctx.arc(p.x,p.y,p.r,0,Math.PI*2);
+      ctx.fillStyle=p.color+(speaking?p.alpha*2:p.alpha)+')';
+      ctx.fill();
+    }
+    for(var i=0;i<particles.length;i++){
+      for(var j=i+1;j<particles.length;j++){
+        var dx=particles[i].x-particles[j].x;
+        var dy=particles[i].y-particles[j].y;
+        var dist=Math.sqrt(dx*dx+dy*dy);
+        if(dist<120){
+          ctx.beginPath();
+          ctx.moveTo(particles[i].x,particles[i].y);
+          ctx.lineTo(particles[j].x,particles[j].y);
+          ctx.strokeStyle='rgba(99,102,241,'+(speaking?.15:.06)+')';
+          ctx.lineWidth=.5;
+          ctx.stroke();
+        }
+      }
+    }
+    requestAnimationFrame(draw);
+  }
+  draw();
+
+  window.elliottParticles={setSpeaking:function(v){speaking=v;}};
+})();
+
+// ============================================================
+// AVATAR STATE MANAGEMENT
+// ============================================================
+var avatarState='idle';
+function setAvatarState(state){
+  avatarState=state;
+  var va=document.getElementById('voiceAvatar');
+  if(va){
+    va.classList.remove('avatar-listening','avatar-thinking','avatar-speaking');
+    if(state==='listening')va.classList.add('avatar-listening');
+    else if(state==='thinking')va.classList.add('avatar-thinking');
+    else if(state==='speaking')va.classList.add('avatar-speaking');
+  }
+  var wa=document.getElementById('welcomeAvatar');
+  if(wa){
+    wa.classList.remove('avatar-glow-active');
+    if(state==='thinking'||state==='speaking')wa.classList.add('avatar-glow-active');
+  }
+}
+
+// ============================================================
+// TYPEWRITER EFFECT
+// ============================================================
+var typewriterQueue=[];
+var typewriterRunning=false;
+
+function typewriterEffect(element,text,speed,callback){
+  speed=speed||12;
+  element.innerHTML='';
+  var i=0;
+  var cursor=document.createElement('span');
+  cursor.className='typewriter-cursor';
+  function type(){
+    if(i<text.length){
+      if(text[i]==='<'){
+        var end=text.indexOf('>',i);
+        if(end!==-1){
+          element.innerHTML+=text.substring(i,end+1);
+          i=end+1;
+        }else{
+          element.innerHTML+=text[i];i++;
+        }
+      }else{
+        element.innerHTML+=text[i];i++;
+      }
+      element.appendChild(cursor);
+      var chat=document.getElementById('chatMessages');
+      chat.scrollTop=chat.scrollHeight;
+      setTimeout(type,speed);
+    }else{
+      element.classList.add('typewriter-done');
+      if(cursor.parentNode)cursor.parentNode.removeChild(cursor);
+      if(callback)callback();
+      typewriterRunning=false;
+      processTypewriterQueue();
+    }
+  }
+  typewriterRunning=true;
+  type();
+}
+
+function processTypewriterQueue(){
+  if(typewriterRunning||typewriterQueue.length===0)return;
+  var item=typewriterQueue.shift();
+  typewriterEffect(item.element,item.text,item.speed,item.callback);
+}
+
+function addMessageWithTypewriter(content,isUser,opts){
+  opts=opts||{};
+  if(isUser){
+    addMessage(content,true);
+    return;
+  }
+  var chat=document.getElementById('chatMessages');
+  var w=document.getElementById('welcomeScreen');
+  if(w)w.remove();
+  var m=document.createElement('div');
+  m.className='message assistant view-transition';
+  m.id='msg_'+(++msgCount);
+  var av='<div class="message-avatar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg></div>';
+  var formatted=formatMarkdown(content);
+  var h='<div class="message-avatar">'+av.substring(av.indexOf('>')+1,av.lastIndexOf('<'))+'</div><div class="message-content">';
+  var actionsHTML='';
+  actionsHTML+='<div class="ai-badge">ELLIOTT IA</div>';
+  if(opts.searchUsed)actionsHTML+='<div class="search-badge">Recherche web utilisee</div>';
+  if(typeof opts.confidence==='number'){
+    actionsHTML+='<div class="confidence-bar"><div class="confidence-fill '+confidenceClass(opts.confidence)+'" style="width:'+(opts.confidence*100)+'%"></div></div>';
+  }
+  var mid=m.id;
+  actionsHTML+='<div class="msg-actions">';
+  actionsHTML+='<button class="msg-action-btn" onclick="speakMsg(\''+mid+'\')" title="Ecouter"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg></button>';
+  actionsHTML+='<button class="msg-action-btn" onclick="copyMsg(\''+mid+'\')" title="Copier"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>';
+  actionsHTML+='<button class="msg-action-btn" id="thumbUp_'+mid+'" onclick="sendFeedback(\''+mid+'\',true)" title="Utile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/></svg></button>';
+  actionsHTML+='<button class="msg-action-btn" id="thumbDn_'+mid+'" onclick="sendFeedback(\''+mid+'\',false)" title="Pas utile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"/></svg></button>';
+  actionsHTML+='</div>';
+
+  var contentDiv=document.createElement('div');
+  contentDiv.className='message-content';
+  contentDiv.innerHTML=actionsHTML;
+  m.innerHTML=av;
+  m.appendChild(contentDiv);
+  chat.appendChild(m);
+  chat.scrollTop=chat.scrollHeight;
+  window._lastResponse=content;
+  window._lastResponseEl=m;
+
+  var rendered=formatMarkdown(content);
+  typewriterQueue.push({element:contentDiv, text:rendered, speed:8, callback:null});
+  processTypewriterQueue();
+}
+
+// ============================================================
+// CHART DETECTION
+// ============================================================
+var CHART_KW=['graphique','chart','graph','diagramme','courbe','histogramme','camembert','barres','visualisation'];
+function isChartRequest(msg){
+  var m=msg.toLowerCase();
+  return CHART_KW.some(function(k){return m.indexOf(k)!==-1;});
+}
+
+// ============================================================
+// DOCUMENT UPLOAD
+// ============================================================
+function handleDocUpload(event){
+  var file=event.target.files[0];
+  if(!file)return;
+  var reader=new FileReader();
+  reader.onload=function(e){
+    var b64=e.target.result;
+    addMessage('Document: '+file.name,true);
+    showTyping('Analyse du document...');
+    setAvatarState('thinking');
+    fetch('/api/document',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({base64:b64,filename:file.name})})
+    .then(function(r){return r.json()})
+    .then(function(d){
+      hideTyping();setAvatarState('idle');
+      if(d.text||d.summary){
+        var content='';
+        if(d.summary)content+=d.summary;
+        if(d.text_preview)content+='<div class="doc-preview">'+escapeHtml(d.text_preview)+'</div>';
+        var chat=document.getElementById('chatMessages');
+        var w=document.getElementById('welcomeScreen');
+        if(w)w.remove();
+        var m=document.createElement('div');m.className='message assistant view-transition';
+        m.id='msg_'+(++msgCount);
+        var av='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
+        m.innerHTML='<div class="message-avatar"><div style="width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--or),var(--rd));display:flex;align-items:center;justify-content:center">'+av+'</div></div><div class="message-content">'+formatMarkdown(content)+'<div class="doc-badge">Document Analyse</div></div>';
+        chat.appendChild(m);chat.scrollTop=chat.scrollHeight;
+        window._lastResponse=content;
+        window._lastResponseEl=m;
+      }else{
+        addMessage('Impossible d\'analyser le document.',false);
+      }
+    })
+    .catch(function(){hideTyping();setAvatarState('idle');addMessage('Erreur lors de l\'analyse du document.',false);});
+  };
+  reader.readAsDataURL(file);
+  event.target.value='';
+}
+
+// ============================================================
+// CHAT IMAGE UPLOAD (inline analysis)
+// ============================================================
+function handleChatImageUpload(event){
+  var file=event.target.files[0];
+  if(!file)return;
+  var reader=new FileReader();
+  reader.onload=function(e){
+    var b64=e.target.result;
+    addMessage('Image: '+file.name,true);
+    showTyping('Analyse de l image...');
+    setAvatarState('thinking');
+    if(window.elliottParticles)window.elliottParticles.setSpeaking(true);
+    fetch('/api/vision',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({base64:b64})})
+    .then(function(r){return r.json()})
+    .then(function(d){
+      hideTyping();setAvatarState('idle');
+      if(window.elliottParticles)window.elliottParticles.setSpeaking(false);
+      if(d.description){
+        var chat=document.getElementById('chatMessages');
+        var w=document.getElementById('welcomeScreen');
+        if(w)w.remove();
+        var m=document.createElement('div');m.className='message assistant view-transition';
+        m.id='msg_'+(++msgCount);
+        var av='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+        var content='<img src="'+b64+'" style="max-width:300px;border-radius:8px;margin-bottom:8px;border:1px solid var(--bd)"><br><strong>Analyse IA:</strong><br>'+formatMarkdown(d.description);
+        m.innerHTML='<div class="message-avatar"><div style="width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--ac),var(--pp));display:flex;align-items:center;justify-content:center">'+av+'</div></div><div class="message-content">'+content+'<div class="ai-badge">Vision IA</div></div>';
+        chat.appendChild(m);chat.scrollTop=chat.scrollHeight;
+      }else{
+        addMessage('Analyse non disponible.',false);
+      }
+    })
+    .catch(function(){hideTyping();setAvatarState('idle');if(window.elliottParticles)window.elliottParticles.setSpeaking(false);addMessage("Erreur d'analyse.",false);});
+  };
+  reader.readAsDataURL(file);
+  event.target.value='';
+}
 </script>
 </body>
 </html>"""
@@ -2195,6 +2767,44 @@ def api_memory():
     return Response(body, content_type="application/json; charset=utf-8")
 
 
+@app.route("/api/chart", methods=["POST"])
+def api_chart():
+    data = request.get_json(silent=True)
+    if not data:
+        return Response(b'{"error":"Invalid"}', status=400, content_type="application/json")
+    prompt = data.get("prompt", "").strip()
+    if not prompt:
+        return Response(b'{"error":"Empty"}', status=400, content_type="application/json")
+    chart_url = generate_chart(prompt)
+    if chart_url:
+        resp = {"chart_url": chart_url, "prompt": prompt, "text": f"Voici le graphique pour: **{prompt}**"}
+    else:
+        resp = {"error": "Impossible de generer le graphique"}
+    body = _json.dumps(resp, ensure_ascii=False).encode("utf-8")
+    return Response(body, content_type="application/json; charset=utf-8")
+
+
+@app.route("/api/document", methods=["POST"])
+def api_document():
+    data = request.get_json(silent=True)
+    if not data:
+        return Response(b'{"error":"Invalid"}', status=400, content_type="application/json")
+    b64 = data.get("base64", "")
+    filename = data.get("filename", "document")
+    if not b64:
+        return Response(b'{"error":"No document"}', status=400, content_type="application/json")
+    text, summary = analyze_document_b64(b64)
+    text_preview = text[:2000] if text else ""
+    resp = {
+        "text": text_preview,
+        "summary": summary,
+        "filename": filename,
+        "text_preview": text_preview,
+    }
+    body = _json.dumps(resp, ensure_ascii=False).encode("utf-8")
+    return Response(body, content_type="application/json; charset=utf-8")
+
+
 # =====================================================================
 #  EDGE TTS - Voix naturelle cote serveur
 # =====================================================================
@@ -2314,10 +2924,15 @@ if __name__ == "__main__":
     print("  Images: Pollinations")
     print("  Musique: MusicGen (HuggingFace)")
     print("  Vision: IA Multimodale")
+    print("  Charts: Matplotlib")
+    print("  Documents: PDF Analysis")
     print("  Code: Python Sandbox")
     print("  Recherche: DuckDuckGo")
     print("  Memoire: " + MEMORY_FILE)
     print("  PWA: Installable sur mobile")
+    print("  Avatar: SVG Anime")
+    print("  Particles: Canvas Background")
+    print("  Typewriter: Text Animation")
     print("  100% GRATUIT!")
     print("=" * 60)
     app.run(debug=False, host="127.0.0.1", port=5000, threaded=True)
