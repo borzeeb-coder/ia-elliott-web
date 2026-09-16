@@ -871,6 +871,34 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica N
 .mic-btn.recording{background:var(--rd);color:#fff;border-color:var(--rd);animation:micPulse 1s infinite}
 @keyframes micPulse{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,.5)}50%{box-shadow:0 0 0 8px rgba(239,68,68,0)}}
 
+.voice-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:linear-gradient(180deg,#0f0a1a 0%,#1a1030 50%,#0f0a1a 100%);z-index:9999;display:none;flex-direction:column;align-items:center;justify-content:center;opacity:0;transition:opacity .3s}
+.voice-overlay.visible{display:flex;opacity:1}
+.voice-header{position:absolute;top:0;left:0;right:0;display:flex;justify-content:space-between;align-items:center;padding:20px 24px}
+.voice-title{font-size:16px;font-weight:600;color:var(--pp);letter-spacing:1px}
+.voice-close{width:40px;height:40px;border-radius:50%;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:#fff;font-size:24px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .2s}
+.voice-close:hover{background:rgba(255,255,255,.15)}
+.voice-body{display:flex;flex-direction:column;align-items:center;gap:24px}
+.voice-circle{width:180px;height:180px;border-radius:50%;background:linear-gradient(135deg,rgba(99,102,241,.2),rgba(139,92,246,.2));border:3px solid rgba(139,92,246,.4);display:flex;align-items:center;justify-content:center;cursor:pointer;transition:all .4s ease;position:relative}
+.voice-circle:hover{transform:scale(1.05);border-color:var(--pp)}
+.voice-circle.voice-idle{background:linear-gradient(135deg,rgba(99,102,241,.15),rgba(139,92,246,.15))}
+.voice-circle.voice-listening{background:linear-gradient(135deg,rgba(34,197,94,.2),rgba(16,185,129,.2));border-color:#22c55e;animation:voicePulse 1.5s infinite}
+.voice-circle.voice-thinking{background:linear-gradient(135deg,rgba(251,191,36,.2),rgba(245,158,11,.2));border-color:#f59e0b;animation:voicePulse 1s infinite}
+.voice-circle.voice-speaking{background:linear-gradient(135deg,rgba(139,92,246,.3),rgba(99,102,241,.3));border-color:var(--pp);animation:voicePulse .8s infinite}
+@keyframes voicePulse{0%,100%{box-shadow:0 0 0 0 rgba(139,92,246,.4)}50%{box-shadow:0 0 0 20px rgba(139,92,246,0)}}
+.voice-icon{width:60px;height:60px;color:var(--pp)}
+.voice-status{font-size:20px;font-weight:600;color:var(--tx);text-align:center;min-height:28px}
+.voice-text{font-size:16px;color:var(--txd);text-align:center;max-width:400px;min-height:24px;font-style:italic;line-height:1.5}
+.voice-waves{display:flex;align-items:center;gap:4px;height:40px;opacity:0;transition:opacity .3s}
+.voice-waves.active{opacity:1}
+.voice-wave{width:4px;background:var(--pp);border-radius:2px;animation:waveAnim 1.2s ease-in-out infinite}
+.voice-wave:nth-child(1){animation-delay:0s;height:12px}
+.voice-wave:nth-child(2){animation-delay:.15s;height:20px}
+.voice-wave:nth-child(3){animation-delay:.3s;height:28px}
+.voice-wave:nth-child(4){animation-delay:.15s;height:20px}
+.voice-wave:nth-child(5){animation-delay:0s;height:12px}
+@keyframes waveAnim{0%,100%{transform:scaleY(.4)}50%{transform:scaleY(1)}}
+.voice-hint{font-size:12px;color:rgba(255,255,255,.3);margin-top:16px}
+
 .welcome{text-align:center;padding:60px 24px;max-width:600px;margin:0 auto;width:100%}
 .welcome-icon{width:80px;height:80px;background:linear-gradient(135deg,var(--ac),var(--pp));border-radius:20px;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;box-shadow:var(--glow)}
 .welcome-icon svg{width:40px;height:40px}
@@ -1165,12 +1193,34 @@ textarea.tool-input{min-height:200px;resize:vertical;font-family:"Fira Code",Con
       <button class="action-btn" onclick="showView('music',document.querySelectorAll('.menu-item')[3])" title="Generer musique">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
       </button>
+      <button class="action-btn voice-btn" onclick="toggleVoiceMode()" title="Mode vocal" style="background:linear-gradient(135deg,#8b5cf6,#6366f1);color:#fff;border:none">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+      </button>
       <button class="action-btn send-btn" onclick="sendMessage()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
       </button>
     </div>
   </div>
 </main>
+
+<div class="voice-overlay" id="voiceOverlay">
+  <div class="voice-header">
+    <span class="voice-title">Agent Vocal ELLIOTT</span>
+    <button class="voice-close" onclick="toggleVoiceMode()">&times;</button>
+  </div>
+  <div class="voice-body">
+    <div class="voice-circle" id="voiceCircle" onclick="onVoiceCircleClick()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="voice-icon"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+    </div>
+    <div class="voice-status" id="voiceStatus">Appuyez pour parler</div>
+    <div class="voice-text" id="voiceText"></div>
+    <div class="voice-waves" id="voiceWaves">
+      <div class="voice-wave"></div><div class="voice-wave"></div><div class="voice-wave"></div>
+      <div class="voice-wave"></div><div class="voice-wave"></div>
+    </div>
+    <div class="voice-hint">Dites "arrête" pour couper la voix</div>
+  </div>
+</div>
 
 <script>
 var convId='c_'+Date.now();
@@ -1188,21 +1238,6 @@ if(SpeechRecognition){
   recognition.continuous=false;
   recognition.interimResults=true;
   recognition.lang='fr-FR';
-  recognition.onresult=function(e){
-    var t='';
-    for(var i=e.resultIndex;i<e.results.length;i++){t+=e.results[i][0].transcript;}
-    document.getElementById('chatInput').value=t;
-  };
-  recognition.onend=function(){
-    isRecording=false;
-    document.getElementById('micBtn').classList.remove('recording');
-    var msg=document.getElementById('chatInput').value.trim();
-    if(msg)sendMessage();
-  };
-  recognition.onerror=function(){
-    isRecording=false;
-    document.getElementById('micBtn').classList.remove('recording');
-  };
 }
 
 function toggleAutoSpeak(){
@@ -1214,6 +1249,148 @@ function toggleMic(){
   if(!recognition){alert('Reconnaissance vocale non supportee.');return;}
   if(isRecording){recognition.stop();isRecording=false;document.getElementById('micBtn').classList.remove('recording');}
   else{synth.cancel();recognition.start();isRecording=true;document.getElementById('micBtn').classList.add('recording');}
+}
+
+var voiceMode=false;
+var voiceState='idle';
+var voiceAudio=null;
+var voiceConvId='voice_'+Date.now();
+
+function toggleVoiceMode(){
+  voiceMode=!voiceMode;
+  var o=document.getElementById('voiceOverlay');
+  if(voiceMode){
+    o.classList.add('visible');
+    voiceState='idle';
+    updateVoiceUI();
+  }else{
+    o.classList.remove('visible');
+    if(voiceAudio){voiceAudio.pause();voiceAudio=null;}
+    if(recognition&&isRecording){recognition.stop();isRecording=false;}
+    synth.cancel();
+    document.getElementById('voiceWaves').classList.remove('active');
+  }
+}
+
+function updateVoiceUI(){
+  var c=document.getElementById('voiceCircle');
+  var s=document.getElementById('voiceStatus');
+  c.className='voice-circle voice-'+voiceState;
+  var labels={idle:'Appuyez pour parler',listening:'Je vous ecoute...',thinking:'Je reflechis...',speaking:'Je parle...'};
+  s.textContent=labels[voiceState]||'';
+}
+
+function onVoiceCircleClick(){
+  if(voiceState==='idle'||voiceState==='listening'){
+    startVoiceListen();
+  }else if(voiceState==='speaking'){
+    stopVoiceSpeak();
+  }
+}
+
+function startVoiceListen(){
+  if(!recognition){alert('Reconnaissance vocale non supportee. Utilisez Chrome ou Edge.');return;}
+  synth.cancel();
+  if(voiceAudio){voiceAudio.pause();voiceAudio=null;}
+  voiceState='listening';
+  updateVoiceUI();
+  document.getElementById('voiceText').textContent='...';
+  document.getElementById('voiceWaves').classList.remove('active');
+  try{recognition.start();isRecording=true;}catch(e){}
+}
+
+function stopVoiceSpeak(){
+  synth.cancel();
+  if(voiceAudio){voiceAudio.pause();voiceAudio=null;}
+  document.getElementById('voiceWaves').classList.remove('active');
+  voiceState='idle';
+  updateVoiceUI();
+  setTimeout(function(){startVoiceListen();},500);
+}
+
+function voiceSend(text){
+  if(!text)return;
+  voiceState='thinking';
+  updateVoiceUI();
+  document.getElementById('voiceText').textContent=text;
+  fetch('/api/voice-chat',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({message:text,conversation_id:voiceConvId})})
+  .then(function(r){return r.json()})
+  .then(function(d){
+    document.getElementById('voiceText').textContent=d.text||'';
+    if(d.audio_url){
+      voiceSpeakURL(d.audio_url,d.text);
+    }else{
+      voiceSpeakBrowser(d.text);
+    }
+  })
+  .catch(function(){
+    voiceState='idle';
+    updateVoiceUI();
+  });
+}
+
+function voiceSpeakURL(url,text){
+  voiceState='speaking';
+  updateVoiceUI();
+  document.getElementById('voiceWaves').classList.add('active');
+  voiceAudio=new Audio(url);
+  voiceAudio.onended=function(){
+    document.getElementById('voiceWaves').classList.remove('active');
+    if(voiceMode){voiceState='idle';updateVoiceUI();setTimeout(function(){startVoiceListen();},500);}
+  };
+  voiceAudio.onerror=function(){
+    voiceSpeakBrowser(text);
+  };
+  voiceAudio.play().catch(function(){voiceSpeakBrowser(text);});
+}
+
+function voiceSpeakBrowser(text){
+  if(!text)return;
+  voiceState='speaking';
+  updateVoiceUI();
+  document.getElementById('voiceWaves').classList.add('active');
+  var c=text.replace(/\n/g,' ').replace(/[#\-*>|_\`\[\]]/g,'').replace(/\s+/g,' ').trim();
+  var u=new SpeechSynthesisUtterance(c);
+  u.lang='fr-FR';u.rate=1.0;
+  u.onend=function(){
+    document.getElementById('voiceWaves').classList.remove('active');
+    if(voiceMode){voiceState='idle';updateVoiceUI();setTimeout(function(){startVoiceListen();},500);}
+  };
+  synth.speak(u);
+}
+
+if(recognition){
+  var origOnResult=recognition.onresult;
+  var origOnEnd=recognition.onend;
+  recognition.onresult=function(e){
+    var t='';
+    for(var i=e.resultIndex;i<e.results.length;i++){t+=e.results[i][0].transcript;}
+    if(voiceMode){
+      document.getElementById('voiceText').textContent=t;
+      document.getElementById('chatInput').value=t;
+    }else{
+      document.getElementById('chatInput').value=t;
+    }
+  };
+  recognition.onend=function(){
+    isRecording=false;
+    document.getElementById('micBtn').classList.remove('recording');
+    if(voiceMode){
+      var msg=document.getElementById('chatInput').value.trim();
+      if(msg){
+        if(msg.toLowerCase().indexOf('arrete')!==-1||msg.toLowerCase().indexOf('stop')!==-1){
+          voiceState='idle';updateVoiceUI();return;
+        }
+        voiceSend(msg);
+      }else{
+        voiceState='idle';updateVoiceUI();
+      }
+    }else{
+      var msg2=document.getElementById('chatInput').value.trim();
+      if(msg2)sendMessage();
+    }
+  };
 }
 
 function toggleSidebar(){document.getElementById('sidebar').classList.toggle('open');}
@@ -2015,6 +2192,113 @@ def api_feedback():
 def api_memory():
     m = get_memory()
     body = _json.dumps(m, ensure_ascii=False).encode("utf-8")
+    return Response(body, content_type="application/json; charset=utf-8")
+
+
+# =====================================================================
+#  EDGE TTS - Voix naturelle cote serveur
+# =====================================================================
+@app.route("/api/tts", methods=["POST"])
+def api_tts():
+    """Genere un fichier audio MP3 via Edge TTS"""
+    data = request.get_json(silent=True)
+    if not data:
+        return Response(b'{"error":"Invalid"}', status=400, content_type="application/json")
+    text = data.get("text", "").strip()
+    voice = data.get("voice", "fr-FR-DeniseNeural")
+    if not text:
+        return Response(b'{"error":"Empty"}', status=400, content_type="application/json")
+
+    try:
+        import asyncio
+        import edge_tts
+
+        audio_id = hashlib.md5(text.encode()).hexdigest()[:12]
+        audio_path = os.path.join(GENERATED_DIR, f"tts_{audio_id}.mp3")
+
+        if not os.path.exists(audio_path):
+            async def generate():
+                communicate = edge_tts.Communicate(text, voice)
+                await communicate.save(audio_path)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(generate())
+            loop.close()
+
+        return send_file(audio_path, mimetype="audio/mpeg")
+    except Exception as e:
+        return Response(
+            _json.dumps({"error": str(e)}).encode("utf-8"),
+            status=500,
+            content_type="application/json"
+        )
+
+
+@app.route("/api/voice-chat", methods=["POST"])
+def api_voice_chat():
+    """Chat + TTS en un seul appel - pour l'agent vocal"""
+    data = request.get_json(silent=True)
+    if not data:
+        return Response(b'{"error":"Invalid"}', status=400, content_type="application/json")
+    message = data.get("message", "").strip()
+    conv_id = data.get("conversation_id", "default")
+    voice = data.get("voice", "fr-FR-DeniseNeural")
+    if not message:
+        return Response(b'{"error":"Empty"}', status=400, content_type="application/json")
+
+    if conv_id not in conversations:
+        conversations[conv_id] = []
+    if len(conversations[conv_id]) > 20:
+        conversations[conv_id] = conversations[conv_id][-10:]
+
+    fast = get_fast_response(message.lower())
+    if fast is not None:
+        conversations[conv_id].append({"role": "user", "content": message})
+        conversations[conv_id].append({"role": "assistant", "content": fast["text"]})
+        ai_text = fast["text"]
+    else:
+        conversations[conv_id].append({"role": "user", "content": message})
+        mem = get_memory()
+        mc = ""
+        if mem.get("corrections"):
+            mc += "Corrections passees: " + "; ".join(
+                [c.get("question", "") + " -> " + c.get("correction", "") for c in mem["corrections"][-5:]]
+            )
+        ai_text = chat_ia(message, conversations[conv_id], mc)
+        conversations[conv_id].append({"role": "assistant", "content": ai_text})
+
+    clean_text = ai_text.replace("\n", " ").replace("#", "").replace("*", "").replace("`", "")
+    clean_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', clean_text)
+    clean_text = clean_text[:500]
+
+    audio_url = None
+    try:
+        import asyncio
+        import edge_tts
+
+        audio_id = hashlib.md5(clean_text.encode()).hexdigest()[:12]
+        audio_path = os.path.join(GENERATED_DIR, f"tts_{audio_id}.mp3")
+
+        if not os.path.exists(audio_path):
+            async def generate():
+                communicate = edge_tts.Communicate(clean_text, voice)
+                await communicate.save(audio_path)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(generate())
+            loop.close()
+
+        audio_url = f"/generated/tts_{audio_id}.mp3"
+    except Exception as e:
+        print(f"TTS error (fallback to browser): {e}")
+        audio_url = None
+
+    resp = {
+        "text": ai_text,
+        "audio_url": audio_url,
+        "voice": voice,
+    }
+    body = _json.dumps(resp, ensure_ascii=False).encode("utf-8")
     return Response(body, content_type="application/json; charset=utf-8")
 
 
