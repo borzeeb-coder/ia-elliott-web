@@ -1,772 +1,2039 @@
 """
-ELLIOTT - Assistant Web Instantane
-Reponses instantanees
+ELLIOTT - IA ULTIME (Version Ultime)
+Chat IA + Images + Voix + Musique + Vision + Code + Memoire Avancee + PWA + Recherche Web
+Tout 100% Gratuit!
 """
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, request, Response, send_file, send_from_directory
+import requests as _requests
+import json as _json
+import os
+import sys
+import time
+import threading
+import tempfile
+import subprocess
+import base64
+import hashlib
+import re
+import shutil
+from io import BytesIO
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
+from urllib.parse import quote
 
 app = Flask(__name__)
-app.secret_key = "elliott-instant-2024"
 
-# Reponses prechargees pour vitesse maximale
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MEMORY_FILE = os.path.join(BASE_DIR, "memory.json")
+GENERATED_DIR = os.path.join(BASE_DIR, "generated")
+os.makedirs(GENERATED_DIR, exist_ok=True)
+
+CHAT_API_KILOCODE = "https://api.kilo.ai/api/gateway/v1/chat/completions"
+CHAT_MODELS = [
+    "kilo-auto/free",
+    "nex-agi/nex-n2.5-pro:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+]
+CHAT_API_POLLINATIONS = "https://text.pollinations.ai/"
+
+# =====================================================================
+#  WEB SEARCH
+# =====================================================================
+def web_search(query, num_results=5):
+    try:
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
+        results = DDGS().text(query, max_results=num_results)
+        return [
+            {"title": r.get("title", ""), "snippet": r.get("body", ""), "url": r.get("href", "")}
+            for r in results
+        ]
+    except Exception as e:
+        print(f"Search error: {e}")
+        return None
+
+
+def needs_web_search(message):
+    search_keywords = [
+        "actualit", "nouveau", "recent", "prix", "cours",
+        "meteo", "aujourd'hui", "2024", "2025", "2026",
+        "dernier", "derniere", "meilleur", "compar",
+        "championnat", "election", "bourse", "cotation",
+    ]
+    msg_lower = message.lower()
+    return any(kw in msg_lower for kw in search_keywords)
+
+
+# =====================================================================
+#  MEMORY SYSTEM (Enhanced)
+# =====================================================================
+memory_lock = threading.Lock()
+
+
+def _default_memory():
+    return {
+        "conversations": [],
+        "conversation_summaries": [],
+        "topics": {},
+        "corrections": [],
+        "knowledge_base": {},
+        "preferences": {
+            "response_style": "medium",
+            "language": "fr",
+            "favorite_topics": [],
+        },
+        "stats": {
+            "total_conversations": 0,
+            "total_messages": 0,
+            "topics_learned": 0,
+            "corrections_made": 0,
+            "thumbs_up": 0,
+            "thumbs_down": 0,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "images_generated": 0,
+            "music_generated": 0,
+            "code_executed": 0,
+            "images_analyzed": 0,
+            "searches_performed": 0,
+            "quality_score_avg": 0.0,
+        },
+        "feedback": [],
+        "quality_log": [],
+    }
+
+
+def load_memory():
+    try:
+        if os.path.exists(MEMORY_FILE):
+            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                m = _json.load(f)
+            for k, v in _default_memory().items():
+                if k not in m:
+                    m[k] = v
+            return m
+    except Exception:
+        pass
+    return _default_memory()
+
+
+def save_memory(m):
+    try:
+        with memory_lock:
+            with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+                _json.dump(m, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Memory save error: {e}")
+
+
+def get_memory():
+    return load_memory()
+
+
+def update_memory(update_fn):
+    m = load_memory()
+    update_fn(m)
+    save_memory(m)
+    return m
+
+
+def extract_topics(text):
+    topics = []
+    keyword_map = {
+        "python": "python", "javascript": "javascript", "js": "javascript",
+        "html": "html", "css": "css", "react": "react", "node": "nodejs",
+        "flask": "flask", "django": "django", "api": "api",
+        "machine learning": "machine learning", "ml": "machine learning",
+        "ia": "intelligence artificielle", "intelligence artificielle": "intelligence artificielle",
+        "deep learning": "deep learning", "neural": "reseau neuronal",
+        "image": "images", "photo": "images", "dessin": "images",
+        "musique": "musique", "chanson": "musique",
+        "video": "video", "film": "video",
+        "code": "programmation", "programmer": "programmation", "coder": "programmation",
+        "histoire": "ecriture", "ecrire": "ecriture", "texte": "ecriture",
+        "maths": "mathematiques", "mathematiques": "mathematiques",
+        "science": "sciences", "physique": "sciences",
+        "artisanat": "artisanat", "tricot": "artisanat", "crochet": "artisanat",
+        "couture": "artisanat", "bricolage": "artisanat",
+        "cuisine": "cuisine", "recette": "cuisine",
+        "sport": "sport", "fitness": "sport",
+        "voyage": "voyage", "tourisme": "voyage",
+        "sante": "sante", "medecin": "sante",
+        "finance": "finance", "argent": "finance", "bourse": "finance",
+    }
+    text_lower = text.lower()
+    for keyword, topic in keyword_map.items():
+        if keyword in text_lower:
+            topics.append(topic)
+    return list(set(topics)) if topics else ["general"]
+
+
+def track_topics(m, topics):
+    for t in topics:
+        if t in m["topics"]:
+            m["topics"][t] += 1
+        else:
+            m["topics"][t] = 1
+    m["stats"]["topics_learned"] = len(m["topics"])
+
+
+def find_relevant_memory(m, message):
+    context_parts = []
+    relevant_corrections = []
+    for corr in m.get("corrections", []):
+        if SequenceMatcher(None, message.lower(), corr.get("original", "").lower()).ratio() > 0.4:
+            relevant_corrections.append(corr)
+    if relevant_corrections:
+        context_parts.append("Corrections importantes du passe:")
+        for c in relevant_corrections[-3:]:
+            context_parts.append(
+                f"- '{c.get('original', '')}' -> reponse corrigee: '{c.get('corrected', '')}'"
+            )
+    for kb_key, kb_val in m.get("knowledge_base", {}).items():
+        if SequenceMatcher(None, message.lower(), kb_key.lower()).ratio() > 0.3:
+            context_parts.append(f"Connaissance sur '{kb_key}': {kb_val}")
+    recent = m.get("conversations", [])[-5:]
+    if recent:
+        context_parts.append("Conversations recentes:")
+        for conv in recent:
+            context_parts.append(f"Q: {conv.get('question', '')[:100]}")
+            context_parts.append(f"R: {conv.get('answer', '')[:100]}")
+    if m.get("preferences", {}).get("favorite_topics"):
+        context_parts.append(
+            f"Sujets preferes: {', '.join(m['preferences']['favorite_topics'][:5])}"
+        )
+    return "\n".join(context_parts) if context_parts else ""
+
+
+def record_correction(m, original, corrected, conversation_id=""):
+    m["corrections"].append({
+        "original": original,
+        "corrected": corrected,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "conversation_id": conversation_id,
+    })
+    m["stats"]["corrections_made"] = len(m["corrections"])
+
+
+def record_knowledge(m, topic, info):
+    m["knowledge_base"][topic] = info
+
+
+def calculate_confidence(response_text):
+    if not response_text or len(response_text.strip()) < 5:
+        return 0.1
+    uncertainty_markers = [
+        "je ne suis pas sur", "peut-etre", "probablement",
+        "il se pourrait", "je pense que", "pas certain",
+        "i'm not sure", "maybe", "i think",
+        "je ne sais pas", "aucune idee", "impossible de savoir",
+    ]
+    text_lower = response_text.lower()
+    uncertainty_count = sum(1 for marker in uncertainty_markers if marker in text_lower)
+    confidence = 1.0
+    confidence -= uncertainty_count * 0.15
+    if len(response_text) < 30:
+        confidence -= 0.1
+    if response_text.endswith("?"):
+        confidence -= 0.05
+    return max(0.1, min(1.0, confidence))
+
+
+def calculate_quality(answer, topics):
+    quality = 0.5
+    if len(answer) > 100:
+        quality += 0.1
+    if len(answer) > 300:
+        quality += 0.1
+    if "```" in answer:
+        quality += 0.1
+    if any(m in answer for m in ["- ", "1.", "##", "**"]):
+        quality += 0.05
+    if len(topics) > 0 and "general" not in topics:
+        quality += 0.1
+    return min(1.0, quality)
+
+
+def summarize_old_conversations(m):
+    convs = m.get("conversations", [])
+    if len(convs) <= 50:
+        return
+    old = convs[:-20]
+    topics_summary = {}
+    for c in old:
+        for t in c.get("topics", []):
+            topics_summary[t] = topics_summary.get(t, 0) + 1
+    m["conversation_summaries"] = m.get("conversation_summaries", [])
+    m["conversation_summaries"].append({
+        "period": f"{old[0].get('timestamp', '')} - {old[-1].get('timestamp', '')}",
+        "count": len(old),
+        "topics": topics_summary,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    m["conversations"] = convs[-20:]
+
+
+def semantic_search(message, conversations, max_results=5):
+    results = []
+    msg_words = set(message.lower().split())
+    for conv in conversations:
+        conv_text = (conv.get("question", "") + " " + conv.get("answer", "")).lower()
+        conv_words = set(conv_text.split())
+        if msg_words and conv_words:
+            overlap = len(msg_words & conv_words)
+            total = len(msg_words | conv_words)
+            score = overlap / total if total > 0 else 0
+            if message.lower() in conv_text:
+                score += 0.5
+            if score > 0.1:
+                results.append((score, conv))
+    results.sort(key=lambda x: x[0], reverse=True)
+    return [r[1] for r in results[:max_results]]
+
+
+# =====================================================================
+#  MUSIC GENERATION
+# =====================================================================
+def generate_music(prompt):
+    spaces_to_try = [
+        ("facebook/MusicGen", "/predict_batched"),
+    ]
+    for space, api_name in spaces_to_try:
+        try:
+            from gradio_client import Client
+            client = Client(space, verbose=False)
+            melody_file = _create_tone_file()
+            result = client.predict(
+                texts=prompt,
+                melodies=melody_file,
+                api_name=api_name,
+            )
+            if result:
+                src = result if isinstance(result, str) else (result[0] if isinstance(result, tuple) else None)
+                if src and os.path.exists(str(src)):
+                    ext = os.path.splitext(str(src))[1] or ".wav"
+                    dest = os.path.join(GENERATED_DIR, f"music_{int(time.time())}{ext}")
+                    shutil.copy2(str(src), dest)
+                    return dest
+        except Exception as e:
+            print(f"MusicGen error ({space}): {e}")
+            continue
+    return _generate_procedural_music(prompt)
+
+
+def _create_tone_file():
+    import wave as _wave
+    import math as _math
+    import struct as _struct
+    sr = 44100
+    dur = 3
+    freq = 440
+    filename = os.path.join(tempfile.gettempdir(), "melody_tone.wav")
+    with _wave.open(filename, "w") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        for i in range(int(sr * dur)):
+            v = int(32767 * 0.3 * _math.sin(2 * _math.pi * freq * i / sr))
+            w.writeframes(_struct.pack("<h", v))
+    return filename
+
+
+def _generate_procedural_music(prompt):
+    import wave as _wave
+    import math as _math
+    import struct as _struct
+    try:
+        sr = 44100
+        duration = 10
+        prompt_hash = hashlib.md5(prompt.encode()).hexdigest()
+        seed_val = int(prompt_hash[:8], 16) % 1000
+        base_freq = 220 + (seed_val % 440)
+        tempo = 2 + (seed_val % 6)
+        filename = os.path.join(GENERATED_DIR, f"music_{int(time.time())}.wav")
+        with _wave.open(filename, "w") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            for i in range(int(sr * duration)):
+                t = i / sr
+                freq1 = base_freq * (1 + 0.5 * _math.sin(2 * _math.pi * tempo * t))
+                freq2 = base_freq * 1.5 * (1 + 0.3 * _math.sin(2 * _math.pi * (tempo * 0.7) * t))
+                freq3 = base_freq * 2 * (1 + 0.2 * _math.sin(2 * _math.pi * (tempo * 1.3) * t))
+                envelope = _math.sin(_math.pi * t / duration)
+                val = (
+                    0.3 * _math.sin(2 * _math.pi * freq1 * t) +
+                    0.15 * _math.sin(2 * _math.pi * freq2 * t) +
+                    0.1 * _math.sin(2 * _math.pi * freq3 * t)
+                ) * envelope
+                sample = int(32767 * max(-1, min(1, val)))
+                w.writeframes(_struct.pack("<h", sample))
+        return filename
+    except Exception as e:
+        print(f"Procedural music error: {e}")
+        return None
+
+
+# =====================================================================
+#  VISION / IMAGE ANALYSIS
+# =====================================================================
+def analyze_image_url(url):
+    try:
+        r = _requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return "Impossible de charger l'image."
+        content_type = r.headers.get("content-type", "")
+        is_img = "image" in content_type or any(
+            url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"]
+        )
+        if not is_img:
+            return "L'URL ne pointe pas vers une image."
+        info = ""
+        try:
+            from PIL import Image
+            img = Image.open(BytesIO(r.content))
+            info = f"Image {img.format}, {img.size[0]}x{img.size[1]} pixels, mode {img.mode}"
+            if img.mode == "RGB":
+                img_small = img.resize((50, 50))
+                pixels = list(img_small.getdata())
+                avg_r = sum(p[0] for p in pixels) // len(pixels)
+                avg_g = sum(p[1] for p in pixels) // len(pixels)
+                avg_b = sum(p[2] for p in pixels) // len(pixels)
+                info += f", couleur dominante: rgb({avg_r},{avg_g},{avg_b})"
+        except Exception:
+            info = f"Image chargee ({len(r.content)} octets)"
+        b64 = base64.b64encode(r.content).decode("utf-8")
+        ai_desc = _describe_image_with_ai(b64, content_type)
+        return ai_desc if ai_desc else info
+    except Exception as e:
+        return f"Erreur d'analyse: {str(e)}"
+
+
+def analyze_image_b64(data_url):
+    try:
+        if "," in data_url:
+            header, b64data = data_url.split(",", 1)
+        else:
+            header = "data:image/png;base64"
+            b64data = data_url
+        content_type = "image/png"
+        if "jpeg" in header or "jpg" in header:
+            content_type = "image/jpeg"
+        img_bytes = base64.b64decode(b64data)
+        info = ""
+        try:
+            from PIL import Image
+            img = Image.open(BytesIO(img_bytes))
+            info = f"Image {img.format}, {img.size[0]}x{img.size[1]} pixels"
+        except Exception:
+            info = f"Image chargee ({len(img_bytes)} octets)"
+        ai_desc = _describe_image_with_ai(b64data, content_type)
+        return ai_desc if ai_desc else info
+    except Exception as e:
+        return f"Erreur d'analyse: {str(e)}"
+
+
+def _describe_image_with_ai(base64_image, content_type):
+    for model in CHAT_MODELS:
+        try:
+            messages = [
+                {"role": "system", "content": "Tu es un assistant IA expert en vision par ordinateur. Tu decris les images en detail en francais. Sois precis et descriptif."},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Decris cette image en detail en francais: qu'est-ce qu'on voit, les couleurs, les objets, l'ambiance?"},
+                    {"type": "image_url", "image_url": {"url": f"data:{content_type};base64,{base64_image}"}}
+                ]}
+            ]
+            r = _requests.post(
+                CHAT_API_KILOCODE,
+                json={"model": model, "messages": messages, "max_tokens": 500, "temperature": 0.5},
+                timeout=30,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if "choices" in data and data["choices"]:
+                    content = data["choices"][0].get("message", {}).get("content", "")
+                    if content and len(content.strip()) > 10:
+                        return content
+        except Exception:
+            continue
+    return None
+
+
+# =====================================================================
+#  CODE EXECUTOR
+# =====================================================================
+BLOCKED_KEYWORDS = [
+    "os.system", "subprocess", "shutil.rmtree", "__import__('os')",
+    "__import__(\"os\")", "eval(", "execfile", "compile(",
+    "import ctypes", "import socket", "import multiprocessing",
+]
+
+
+def execute_python_code(code, timeout=10):
+    if len(code) > 10000:
+        return {"error": "Code trop long (max 10000 caracteres)"}
+    code_lower = code.lower()
+    for kw in BLOCKED_KEYWORDS:
+        if kw.lower() in code_lower:
+            return {"error": f"Commande non autorisee detectee: {kw}"}
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=tempfile.gettempdir(),
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONIOENCODING": "utf-8"},
+        )
+        return {
+            "stdout": result.stdout[-5000:] if result.stdout else "",
+            "stderr": result.stderr[-2000:] if result.stderr else "",
+            "returncode": result.returncode,
+        }
+    except subprocess.TimeoutExpired:
+        return {"error": f"Timeout: le code a depasse {timeout} secondes"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# =====================================================================
+#  CHAT API
+# =====================================================================
+def chat_ia(message, history, memory_context="", web_context=""):
+    system = (
+        "Tu es ELLIOTT, un assistant IA super intelligent, polyvalent et serviable. "
+        "Tu reponds toujours en francais. Tu es expert en: programmation, technologie, "
+        "sciences, art, musique, creation, artisanat, cuisine, et bien plus. "
+        "Tu peux: coder, expliquer, creer, ecrire, traduire, analyser, conseiller. "
+        "Tu es creatif, precis et amical. Tu reponds en markdown avec du code formate. "
+        "Tu t'adaptes au style de l'utilisateur."
+    )
+    if memory_context:
+        system += f"\n\nContexte memoire (souviens-toi de ceci pour repondre mieux):\n{memory_context}"
+    if web_context:
+        system += web_context
+
+    messages = [{"role": "system", "content": system}]
+    for msg in history[-10:]:
+        messages.append(msg)
+    messages.append({"role": "user", "content": message})
+
+    for model in CHAT_MODELS:
+        try:
+            r = _requests.post(
+                CHAT_API_KILOCODE,
+                json={"model": model, "messages": messages, "max_tokens": 1024, "temperature": 0.7},
+                timeout=60,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if "choices" in data and data["choices"]:
+                    content = data["choices"][0]["message"]["content"]
+                    if content and len(content.strip()) > 0:
+                        return content
+        except Exception as e:
+            print(f"KiloCode error ({model}): {e}")
+
+    try:
+        r = _requests.post(
+            CHAT_API_POLLINATIONS,
+            json={"messages": messages, "model": "openai"},
+            timeout=60,
+        )
+        if r.status_code == 200 and len(r.text) > 10:
+            return r.text.strip()
+    except Exception as e:
+        print(f"Pollinations error: {e}")
+
+    return "Je suis temporairement indisponible. Verifiez votre connexion internet."
+
+
+def generate_image(prompt):
+    try:
+        encoded = _requests.utils.quote(prompt)
+        return (
+            f"https://image.pollinations.ai/prompt/{encoded}"
+            "?width=1024&height=768&nologo=true"
+        )
+    except Exception as e:
+        print(f"Image error: {e}")
+        return None
+
+
+# =====================================================================
+#  FAST RESPONSES
+# =====================================================================
 FAST_RESPONSES = {
-    # Salutations
-    "bonjour": {"text": "Bonjour! Je suis ELLIOTT. Comment puis-je vous aider?", "suggestions": ["Coder", "Apprendre", "Aide"]},
-    "salut": {"text": "Salut! Je suis ELLIOTT. Que puis-je faire pour vous?", "suggestions": ["Coder", "Apprendre", "Aide"]},
-    "hello": {"text": "Hello! Je suis ELLIOTT. Comment puis-je vous aider?", "suggestions": ["Coder", "Apprendre", "Aide"]},
-    "coucou": {"text": "Coucou! Je suis ELLIOTT. Que puis-je faire pour vous?", "suggestions": ["Coder", "Apprendre", "Aide"]},
-    "bonsoir": {"text": "Bonsoir! Je suis ELLIOTT. Comment puis-je vous aider?", "suggestions": ["Coder", "Apprendre", "Aide"]},
-    
-    # Merci
-    "merci": {"text": "Avec plaisir! Autre chose?", "suggestions": ["Poser une question", "Voir les sujets"]},
-    "thanks": {"text": "De rien! Autre chose?", "suggestions": ["Poser une question", "Voir les sujets"]},
-    
-    # Qui es-tu
-    "qui es-tu": {"text": "Je suis ELLIOTT, votre assistant intelligent. Je peux coder, expliquer, rechercher, ecrire et traduire!", "suggestions": ["Mes capacites", "Essayer", "Aide"]},
-    "qui etes-vous": {"text": "Je suis ELLIOTT, votre assistant intelligent. Je peux tout faire!", "suggestions": ["Mes capacites", "Essayer", "Aide"]},
-    "presente-toi": {"text": "Je suis ELLIOTT, un assistant intelligent. Je peux vous aider a coder, apprendre, creer et resoudre des problemes!", "suggestions": ["Coder", "Apprendre", "Creer"]},
-    
-    # Capacites
-    "capacite": {"text": "Je peux:\n  - Coder (Python, JS, HTML...)\n  - Expliquer des sujets\n  - Rechercher des infos\n  - Ecrire des articles\n  - Traduire en 100+ langues", "suggestions": ["Python", "JavaScript", "HTML"]},
-    "pouvoir": {"text": "Je peux:\n  - Coder (Python, JS, HTML...)\n  - Expliquer des sujets\n  - Rechercher des infos\n  - Ecrire des articles\n  - Traduire en 100+ langues", "suggestions": ["Python", "JavaScript", "HTML"]},
-    "fonction": {"text": "Je peux:\n  - Coder (Python, JS, HTML...)\n  - Expliquer des sujets\n  - Rechercher des infos\n  - Ecrire des articles\n  - Traduire en 100+ langues", "suggestions": ["Python", "JavaScript", "HTML"]},
-    
-    # Sujets techniques
-    "python": {"text": "Python est un langage simple et puissant. Utilise pour l'IA, le web, la data science.\n\nConseils:\n  - List comprehensions\n  - Virtual environments\n  - PEP 8 pour le style", "suggestions": ["Flask", "Django", "Machine Learning"]},
-    "javascript": {"text": "JavaScript est le langage du web. Sites interactifs, apps mobiles, serveurs.\n\nConseils:\n  - ES6+\n  - React ou Vue.js\n  - Node.js pour le backend", "suggestions": ["React", "HTML", "Node.js"]},
-    "html": {"text": "HTML structure les pages web. Le squelette de tout site.\n\nConseils:\n  - Balises semantiques\n  - Accessibilite\n  - Validation", "suggestions": ["CSS", "JavaScript", "Web"]},
-    "css": {"text": "CSS style les pages web. Couleurs, animations, mises en page.\n\nConseils:\n  - Flexbox et Grid\n  - Variables CSS\n  - Mobile-first", "suggestions": ["HTML", "JavaScript", "Responsive"]},
-    "ia": {"text": "L'IA permet aux machines d'apprendre et de raisonner. L'avenir de la tech.\n\nConseils:\n  - Machine Learning d'abord\n  - Reseaux de neurones\n  - Donnees = petrole", "suggestions": ["Machine Learning", "Python", "Deep Learning"]},
-    "machine learning": {"text": "Le ML permet aux ordinateurs d'apprendre sans programmation explicite.\n\nConseils:\n  - Scikit-learn\n  - TensorFlow/PyTorch\n  - Donnees cruciales", "suggestions": ["Python", "IA", "Deep Learning"]},
-    "api": {"text": "Une API permet a deux apps de communiquer.\n\nConseils:\n  - REST est le standard\n  - GraphQL alternative\n  - Documenter toujours", "suggestions": ["Python", "JavaScript", "Web"]},
-    "git": {"text": "Git gere les versions du code. Sauvegarde, collaboration, retour arriere.\n\nConseils:\n  - Commits = sauvegardes\n  - Branches = features\n  - GitHub pour collab", "suggestions": ["GitHub", "Code", "Collaboration"]},
-    "database": {"text": "Une BDD stocke et organise les informations.\n\nConseils:\n  - SQL pour relationnel\n  - MongoDB pour NoSQL\n  - Indexer pour perf", "suggestions": ["SQL", "MongoDB", "Backend"]},
-    "react": {"text": "React est une librairie JS pour interfaces interactives.\n\nConseils:\n  - Composants = base\n  - Hooks simplifient\n  - React DevTools", "suggestions": ["JavaScript", "Vue", "Frontend"]},
-    "flask": {"text": "Flask est un micro-framework Python simple et flexible.\n\nConseils:\n  - Leger et rapide\n  - Extensions pour tout\n  - Parfait pour debuter", "suggestions": ["Python", "Django", "Backend"]},
-    "django": {"text": "Django est un framework Python pour sites puissants.\n\nConseils:\n  - Admin inclus\n  - ORM pour DB\n  - Securite integree", "suggestions": ["Python", "Flask", "Backend"]},
-    
-    # Intentions
-    "code": {"text": "Que voulez-vous creer? Je peux vous guider!", "suggestions": ["Python", "JavaScript", "HTML/CSS", "App mobile", "Bot Discord", "Jeu"]},
-    "coder": {"text": "Que voulez-vous creer? Je peux vous guider!", "suggestions": ["Python", "JavaScript", "HTML/CSS", "App mobile", "Bot Discord", "Jeu"]},
-    "programmer": {"text": "Que voulez-vous creer? Je peux vous guider!", "suggestions": ["Python", "JavaScript", "HTML/CSS", "App mobile", "Bot Discord", "Jeu"]},
-    
-    "apprendre": {"text": "Qu'est-ce que vous aimeriez apprendre?", "suggestions": ["Python", "HTML/CSS", "Machine Learning", "Git", "API REST", "Securite"]},
-    "etudier": {"text": "Qu'est-ce que vous aimeriez apprendre?", "suggestions": ["Python", "HTML/CSS", "Machine Learning", "Git", "API REST", "Securite"]},
-    "comprendre": {"text": "Qu'est-ce que vous aimeriez comprendre?", "suggestions": ["Python", "HTML/CSS", "Machine Learning", "Git", "API REST", "Securite"]},
-    
-    "creer": {"text": "Quel type de projet vous interest?", "suggestions": ["Portfolio", "Blog", "Automatisation", "Dashboard", "Chatbot", "Jeu"]},
-    "faire": {"text": "Quel type de projet vous interest?", "suggestions": ["Portfolio", "Blog", "Automatisation", "Dashboard", "Chatbot", "Jeu"]},
-    
-    "travail": {"text": "Dans quel domaine souhaitez-vous evoluer?", "suggestions": ["Dev Web", "Data Scientist", "DevOps", "Cybersecurite", "IA Engineer", "Freelance"]},
-    "carriere": {"text": "Dans quel domaine souhaitez-vous evoluer?", "suggestions": ["Dev Web", "Data Scientist", "DevOps", "Cybersecurite", "IA Engineer", "Freelance"]},
-    "emploi": {"text": "Dans quel domaine souhaitez-vous evoluer?", "suggestions": ["Dev Web", "Data Scientist", "DevOps", "Cybersecurite", "IA Engineer", "Freelance"]},
-    
-    "aide": {"text": "Je suis la pour vous aider! Decrivez votre probleme:", "suggestions": ["Coder", "Apprendre", "Creer", "Resoudre un bug"]},
-    "help": {"text": "Je suis la pour vous aider! Decrivez votre probleme:", "suggestions": ["Coder", "Apprendre", "Creer", "Resoudre un bug"]},
-    
-    # Defaut
-    "defaut": {"text": "Je comprends! Voici ce que je peux faire:", "suggestions": ["Coder", "Apprendre", "Creer", "Rechercher", "Ecrire", "Traduire"]},
+    "bonjour": {
+        "text": (
+            "Bonjour! Je suis **ELLIOTT**, votre assistant IA ultime. Je peux:\n\n"
+            "- **Coder** dans toutes les langages\n"
+            "- **Generer des images** et de la **musique**\n"
+            "- **Analyser des images** avec la vision IA\n"
+            "- **Executer du code** Python\n"
+            "- **Rechercher** sur le web\n"
+            "- **Expliquer** n'importe quel sujet\n"
+            "- **Ecrire** des histoires, articles\n"
+            "- **Apprendre** de nos conversations\n\n"
+            "Que puis-je faire pour vous?"
+        ),
+        "speak": "Bonjour! Je suis ELLIOTT, votre assistant IA.",
+    },
+    "salut": {
+        "text": "Salut! Je suis **ELLIOTT**. Comment puis-je vous aider aujourd'hui?",
+        "speak": "Salut! Je suis ELLIOTT.",
+    },
+    "merci": {
+        "text": "Avec plaisir! N'hesitez pas si vous avez d'autres questions.",
+        "speak": "Avec plaisir!",
+    },
+    "qui es tu": {
+        "text": (
+            "Je suis **ELLIOTT**, un assistant IA revolutionnaire!\n\n"
+            "- Je **recherche** sur le web en temps reel\n"
+            "- Je **genere** de la musique et des images\n"
+            "- Je **分析** les images avec la vision IA\n"
+            "- Je **execute** du code Python\n"
+            "- Je **'apprends** de nos conversations\n"
+            "- Je **retiens** vos preferences\n\n"
+            "100% gratuit, 100% pour vous!"
+        ),
+        "speak": "Je suis ELLIOTT, votre assistant IA revolutionnaire.",
+    },
 }
 
-# Base etendue
-KNOWLEDGE = {
-    "python": "Python est un langage simple et puissant pour l'IA, le web, la data science.",
-    "javascript": "JavaScript est le langage du web pour sites interactifs.",
-    "html": "HTML structure les pages web.",
-    "css": "CSS style les pages web.",
-    "ia": "L'IA permet aux machines d'apprendre et de raisonner.",
-    "machine learning": "Le ML permet aux ordinateurs d'apprendre sans programmation explicite.",
-    "api": "Une API permet a deux apps de communiquer.",
-    "git": "Git gere les versions du code.",
-    "database": "Une BDD stocke les informations.",
-    "react": "React est une librairie JS pour interfaces interactives.",
-    "flask": "Flask est un micro-framework Python simple.",
-    "django": "Django est un framework Python pour sites puissants.",
-    "sql": "SQL est le langage pour bases de donnees relationnelles.",
-    "mongodb": "MongoDB est une base NoSQL flexible.",
-    "node.js": "Node.js permet de faire du JavaScript cote serveur.",
-    "vue": "Vue.js est un framework JS progressif.",
-    "angular": "Angular est un framework JS complet.",
-    "typescript": "TypeScript est JavaScript avec des types.",
-    "rust": "Rust est un langage performant et securise.",
-    "go": "Go est un langage rapide et simple.",
-    "java": "Java est un langage portable et robuste.",
-    "c++": "C++ est un langage performant pour systemes.",
-    "php": "PHP est un langage pour sites web dynamiques.",
-    "ruby": "Ruby est un langage elegant et productif.",
-    "swift": "Swift est le langage pour apps Apple.",
-    "kotlin": "Kotlin est le langage modern pour Android.",
-    "devops": "DevOps combine developpement et operations.",
-    "cloud": "Le cloud permet d'heberger des apps en ligne.",
-    "cybersecurite": "La cybersecurite protege les systemes informatiques.",
-    "blockchain": "La blockchain est une technologie de registre distribue.",
-    "iot": "L'IoT connecte les objets quotidiens a Internet.",
-    "大数据": "Le Big Data analyse de grands volumes de donnees.",
-    "web": "Le web est un ensemble de pages accessibles via Internet.",
-    "frontend": "Le frontend est ce que l'utilisateur voit.",
-    "backend": "Le backend gere la logique cote serveur.",
-    "fullstack": "Le fullstack combine frontend et backend.",
-    "mobile": "Le developpement mobile cree des apps pour smartphones.",
-    "api rest": "REST est une architecture pour API web.",
-    "graphql": "GraphQL est une alternative a REST pour API.",
-    "docker": "Docker containerise les applications.",
-    "kubernetes": "Kubernetes orchestre les conteneurs.",
-    "linux": "Linux est un systeme d'exploitation open source.",
-    "windows": "Windows est le systeme d'exploitation de Microsoft.",
-    "macos": "macOS est le systeme d'exploitation d'Apple.",
-    "seo": "Le SEO optimise le referencement naturel.",
-    "ux": "L'UX design ameliore l'experience utilisateur.",
-    "ui": "Le UI design concoit l'interface utilisateur.",
-    "agile": "Agile est une methode de gestion de projet.",
-    "scrum": "Scrum est un framework Agile.",
-    "test": "Les tests garantissent la qualite du code.",
-    "debug": "Le debug consiste a trouver et corriger les bugs.",
-    "optimisation": "L'optimisation ameliore les performances.",
-    "securite": "La securite protege les systemes contre les attaques.",
-    "reseau": "Les reseaux connectent les ordinateurs entre eux.",
-    "serveur": "Un serveur fournit des services a d'autres ordinateurs.",
-    "base de donnees": "Une BDD stocke et organise les informations.",
-    "algorithmique": "L'algorithmique resout des problemes etapes par etapes.",
-    "programmation": "La programmation consiste a ecrire du code.",
-    "developpement": "Le developpement cree des logiciels et applications.",
-    "informatique": "L'informatique traite l'information avec des ordinateurs.",
-    "technologie": "La technologie applique les sciences pour resoudre des problemes.",
-    "innovation": "L'innovation introduit des solutions nouvelles.",
-    "startup": "Une startup est une entreprise innovante en croissance rapide.",
-    "freelance": "Un freelance travaille en independant.",
-    "formation": "La formation permet d'apprendre de nouvelles competences.",
-    "diplome": "Un diplome certifie des competences.",
-    "portfolio": "Un portfolio montre vos realisations.",
-    "cv": "Un CV resume votre parcours professionnel.",
-    "entretien": "Un entretien evalue votre candidature.",
-    "salaire": "Le salaire est la retribution du travail.",
-    "contrat": "Un contrat lie employer et employe.",
-    "entreprise": "Une entreprise est une organisation commerciale.",
-    "societe": "Une societe est une personne morale.",
-    "economie": "L'economie etude la production et consommation.",
-    "finance": "La finance gere l'argent et les investissements.",
-    "marketing": "Le marketing promeut les produits et services.",
-    "vente": "La vente consiste a vendre des produits ou services.",
-    "communication": "La communication echange des informations.",
-    "management": "Le management gere les equipes et projets.",
-    "leadership": "Le leadership guide et inspire les autres.",
-    "productivite": "La productivite optimise l'efficacite du travail.",
-    "organisation": "L'organisation structure les activites.",
-    "gestion": "La gestion administre les ressources.",
-    "strategie": "La strategie definit les objectifs et moyens.",
-    "planning": "Le planning organise le temps.",
-    "deadline": "Une deadline est une date limite.",
-    "objectif": "Un objectif est un but a atteindre.",
-    "resultat": "Un resultat est le fruit d'une action.",
-    "succes": "Le succes est l'atteinte d'un objectif.",
-    "echec": "L'echec est la non-reussite d'un objectif.",
-    "erreur": "Une erreur est une faute a corriger.",
-    "probleme": "Un probleme est une difficulte a resoudre.",
-    "solution": "Une solution resout un probleme.",
-    "idee": "Une idee est une reflexion ou proposition.",
-    "creativite": "La creativite genere des idees nouvelles.",
-    "imagination": "L'imagination cree des images mentales.",
-    "curiosite": "La curiosite pousse a decouvrir.",
-    "perseverance": "La perseverance persiste malgre les difficultes.",
-    "motivation": "La motivation pousse a agir.",
-    "inspiration": "L'inspiration genere des idees.",
-    "passion": "La passion est un interet intense.",
-    "ambition": "L'ambition est le desir de reussir.",
-    "confiance": "La confiance est la croyance en soi.",
-    "respect": "Le respect considere les autres.",
-    "honneur": "L'honneur est la dignite et integrite.",
-    "loyaute": "La loyaute est la fidelite.",
-    "honnetete": "L'honnetete est la sincerite.",
-    "justice": "La justice est l'equite et la beaute.",
-    "liberte": "La liberte est l'absence de contrainte.",
-    "egalite": "L'egalite est l'absence de discrimination.",
-    "fraternite": "La fraternite est la solidarite.",
-    "paix": "La paix est l'absence de conflit.",
-    "guerre": "La guerre est un conflit arme.",
-    "amour": "L'amour est un sentiment profond.",
-    "amitie": "L'amitie est un lien affectif.",
-    "famille": "La famille est un groupe de proches.",
-    "sante": "La sante est l'etat de bien-etre.",
-    "sport": "Le sport est une activite physique.",
-    "musique": "La musique est un art du son.",
-    "art": "L'art est une expression creatrice.",
-    "cinema": "Le cinema est un art visuel.",
-    "theatre": "Le theatre est un art dramatique.",
-    "danse": "La danse est un art du mouvement.",
-    "photo": "La photographie est un art visuel.",
-    "cuisine": "La cuisine est un art culinaire.",
-    "voyage": "Le voyage est une decouverte de lieux.",
-    "nature": "La nature est le monde vivant.",
-    "environnement": "L'environnement est notre ecosysteme.",
-    "climat": "Le climat est le temps qu'il fait sur une zone.",
-    "energie": "L'energie est la force qui fait fonctionner.",
-    "ecologie": "L'ecologie etude les relations entre etres vivants.",
-    "recyclage": "Le recyclage reutilise les dechets.",
-    "durabilite": "La durabilite respecte les generations futures.",
-    "developpement durable": "Le DD satisfait besoins presents sans compromettre futurs.",
-    "energie renouvelable": "L'ER provient de sources inepuisables.",
-    "solaire": "Le solaire utilise l'energie du soleil.",
-    "eolien": "L'eolien utilise la force du vent.",
-    "hydraulique": "L'hydraulique utilise la force de l'eau.",
-    "nucleaire": "Le nucleaire utilise la fission atomique.",
-    "fossile": "Les fossiles proviennent de matiere organique ancient.",
-    "carbonne": "Le carbone est un element chimique.",
-    "emission": "Une emission est le rejet de gaz.",
-    "pollution": "La pollution degrade l'environnement.",
-    "deforestation": "La deforestation coupe les forets.",
-    "biodiversite": "La biodiversite est la variete du vivant.",
-    "espece menacee": "Une espece menacee risque de disparaitre.",
-    "extinction": "La extinction est la disparition d'une espece.",
-    "conservation": "La conservation protege les ressources.",
-    "protection": "La protection defend contre les dangers.",
-    "prevention": "La prevention evite les problemes.",
-    "sensibilisation": "La sensibilisation eleve la conscience.",
-    "education": "L'education transmet les connaissances.",
-    "culture": "La culture est l'ensemble des connaissances.",
-    "savoir": "Le savoir est l'ensemble des connaissances.",
-    "connaissance": "La connaissance est ce qu'on sait.",
-    "sagesse": "La sagesse est l'usage du savoir.",
-    "verite": "La verite est la conformite avec la realite.",
-    "mensonge": "Le mensonge est l'oppose de la verite.",
-    "confiance2": "La confiance est essentielle.",
-    "honte": "La honte est un sentiment de gêne.",
-    "fierte": "La fierte est un sentiment de satisfaction.",
-    "joie": "La joie est un sentiment de bonheur.",
-    "tristesse": "La tristesse est un sentiment de peine.",
-    "colere": "La colere est un sentiment de rage.",
-    "peur": "La peur est un sentiment d'effroi.",
-    "surprise": "La surprise est un sentiment d'etonnement.",
-    "degout": "Le degout est un sentiment de repulsion.",
-    "ennui": "L'ennui est un sentiment de lasse.",
-    "curiosite2": "La curiosite pousse a decouvrir.",
-    "espoir": "L'espoir est la croyance en un avenir meilleur.",
-    "desespoir": "Le desespoir est l'absence d'espoir.",
-    "confiance3": "La confiance est la croyance en autrui.",
-    "doute": "Le doute est l'incertitude.",
-    "certitude": "La certitude est la conviction.",
-    "evidence": "L'evidence est ce qui est evident.",
-    "mystere": "Le mystere est ce qui est inexplique.",
-    "secret": "Le secret est ce qui est cache.",
-    "surprise2": "La surprise est inattendue.",
-    "coincidence": "La coincidence est un evenement fortuit.",
-    "destin": "Le destin est ce qui est predetermine.",
-    "chance": "La chance est la fortune favorable.",
-    "malchance": "La malchance est la fortune defavorable.",
-    "miracle": "Le miracle est un evenement surnaturel.",
-    "magie": "La magie est l'art de produire des effets extraordinaires.",
-    "fantasie": "Le fantasme est une imagination libre.",
-    "reve": "Le reve est une image mentale pendant le sommeil.",
-    "cauchemar": "Le cauchemar est un mauvais reve.",
-    "imagination2": "L'imagination cree des mondes.",
-    "creativite2": "La creativite innove.",
-    "innovation2": "L'innovation transforme.",
-    "invention": "L'invention cree quelque chose de nouveau.",
-    "decouverte": "La decouverte revele l'inconnu.",
-    "exploration": "L'exploration parcourt l'inconnu.",
-    "aventure": "L'aventure est une experience excitante.",
-    "voyage2": "Le voyage decouvre de nouveaux horizons.",
-    "tourisme": "Le tourisme visite des lieux.",
-    "vacances": "Les vacances sont une periode de repos.",
-    "loisir": "Le loisir est une activite de divertissement.",
-    "divertissement": "Le divertissement amuse et detend.",
-    "jeu": "Le jeu est une activite de recreation.",
-    "sport2": "Le sport entretient la sante.",
-    "culture2": "La culture enrichit l'esprit.",
-    "art2": "L'art exprime les emotions.",
-    "musique2": "La musique touche les coeurs.",
-    "cinema2": "Le cinema raconte des histoires.",
-    "theatre2": "Le theatre represente des scenes.",
-    "danse2": "La danse exprime le mouvement.",
-    "photo2": "La photo capture des instants.",
-    "cuisine2": "La cuisine prepare des plats.",
-    "voyage3": "Le voyage ouvre l'esprit.",
-    "nature2": "La nature inspire.",
-    "environnement2": "L'environnement nous concerne tous.",
-    "climat2": "Le climat change.",
-    "energie2": "L'energie fait tourner le monde.",
-    "ecologie2": "L'ecologie protege la planete.",
-    "recyclage2": "Le recyclage sauve des ressources.",
-    "durabilite2": "La durabilite est essentielle.",
-    "developpement durable2": "Le DD est l'avenir.",
-    "energie renouvelable2": "L'ER est propre.",
-    "solaire2": "Le solaire est gratuit.",
-    "eolien2": "L'eolien est puissant.",
-    "hydraulique2": "L'hydraulique est fiable.",
-    "nucleaire2": "Le nucleaire est controvers\u00e9.",
-    "fossile2": "Les fossiles s'epuisent.",
-    "carbonne2": "Le carbone rechauffe.",
-    "emission2": "Les emissions polluent.",
-    "pollution2": "La pollution detruit.",
-    "deforestation2": "La deforestation denude.",
-    "biodiversite2": "La biodiversite diminue.",
-    "espece menacee2": "Les especes menacentes disparaissent.",
-    "extinction2": "L'extinction est irreversible.",
-    "conservation2": "La conservation sauve.",
-    "protection2": "La protection defend.",
-    "prevention2": "La prevention evite.",
-    "sensibilisation2": "La sensibilisation eleve.",
-    "education2": "L'education emancipe.",
-    "culture3": "La culture enrichit.",
-    "savoir2": "Le savoir libere.",
-    "connaissance2": "La connaissance est le pouvoir.",
-    "sagesse2": "La sagesse guide.",
-    "verite2": "La verite est universelle.",
-    "mensonge2": "Le mensonge detruit.",
-    "confiance4": "La confiance unit.",
-    "honte2": "La honte paralyse.",
-    "fierte2": "La fierte motive.",
-    "joie2": "La joie est communicative.",
-    "tristesse2": "La tristesse passera.",
-    "colere2": "La colere nuit.",
-    "peur2": "La peur empeche.",
-    "surprise3": "La surprise ravit.",
-    "degout2": "Le degout eloigne.",
-    "ennui2": "L'ennui lasse.",
-    "curiosite3": "La curiosite appelle.",
-    "espoir2": "L'espoir guide.",
-    "desespoir2": "Le desespoir isole.",
-    "confiance5": "La confiance rassure.",
-    "doute2": "Le doute retient.",
-    "certitude2": "La certitude ancre.",
-    "evidence2": "L'evidence s'impose.",
-    "mystere2": "Le mystere fascine.",
-    "secret2": "Le secret intrigue.",
-    "surprise4": "La surprise enchante.",
-    "coincidence2": "La coincidence amuse.",
-    "destin2": "Le destin decide.",
-    "chance2": "La chance sourit.",
-    "malchance2": "La malchance frappe.",
-    "miracle2": "Le miracle epaunit.",
-    "magie2": "La magie enchante.",
-    "fantasie2": "Le fantasme reve.",
-    "reve2": "Le reve inspire.",
-    "cauchemar2": "Le cauchemar effraie.",
-    "imagination3": "L'imagination cree.",
-    "creativite3": "La creativite innove.",
-    "innovation3": "L'innovation transforme.",
-    "invention2": "L'invention cree.",
-    "decouverte2": "La decouverte revele.",
-    "exploration2": "L'exploration parcourt.",
-    "aventure2": "L'aventure excite.",
-    "voyage4": "Le voyage decouvre.",
-    "tourisme2": "Le tourisme visite.",
-    "vacances2": "Les vacances reposent.",
-    "loisir2": "Le loisir detend.",
-    "divertissement2": "Le divertissement amuse.",
-    "jeu2": "Le jeu passionne.",
-    "sport3": "Le sport dynamise.",
-    "culture4": "La culture enrichit.",
-    "art3": "L'art exprime.",
-    "musique3": "La musique touche.",
-    "cinema3": "Le cinema raconte.",
-    "theatre3": "Le theatre represente.",
-    "danse3": "La danse exprime.",
-    "photo3": "La photo capte.",
-    "cuisine3": "La cuisine prepare.",
-    "voyage5": "Le voyage ouvre.",
-    "nature3": "La nature inspire.",
-    "environnement3": "L'environnement protege.",
-    "climat3": "Le climat change.",
-    "energie3": "L'energie fait tourner.",
-    "ecologie3": "L'ecologie sauve.",
-    "recyclage3": "Le recyclage reutilise.",
-    "durabilite3": "La durabilite dure.",
-    "developpement durable3": "Le DD dure.",
-    "energie renouvelable3": "L'ER dure.",
-    "solaire3": "Le solaire brille.",
-    "eolien3": "L'eolien souffle.",
-    "hydraulique3": "L'hydraulique coule.",
-    "nucleaire3": "Le nucleaire chauffe.",
-    "fossile3": "Les fossiles brulent.",
-    "carbonne3": "Le carbone chauffe.",
-    "emission3": "Les emissions polluent.",
-    "pollution3": "La pollution pollue.",
-    "deforestation3": "La deforestation coupe.",
-    "biodiversite3": "La biodiversite vit.",
-    "espece menacee3": "Les especes menacentes meurent.",
-    "extinction3": "L'extinction efface.",
-    "conservation3": "La conservation garde.",
-    "protection3": "La protection defend.",
-    "prevention3": "La prevention evite.",
-    "sensibilisation3": "La sensibilisation eleve.",
-    "education3": "L'education enseigne.",
-    "culture5": "La culture transmet.",
-    "savoir3": "Le savoir libere.",
-    "connaissance3": "La connaissance eclaire.",
-    "sagesse3": "La sagesse guide.",
-    "verite3": "La verite est vraie.",
-    "mensonge3": "Le mensonge ment.",
-    "confiance6": "La confiance lie.",
-    "honte3": "La honte gene.",
-    "fierte3": "La fierte grandit.",
-    "joie3": "La joie eclate.",
-    "tristesse3": "La tristesse fond.",
-    "colere3": "La colere explose.",
-    "peur3": "La peur paralyse.",
-    "surprise5": "La surprise surprend.",
-    "degout3": "Le degout repousse.",
-    "ennui3": "L'ennui lasse.",
-    "curiosite4": "La curiosite attire.",
-    "espoir3": "L'espoir vit.",
-    "desespoir3": "Le desespoir meurt.",
-    "confiance7": "La confiance grandit.",
-    "doute3": "Le doute faiblit.",
-    "certitude3": "La certitude croit.",
-    "evidence3": "L'evidence parle.",
-    "mystere3": "Le mystere reste.",
-    "secret3": "Le secret se revele.",
-    "surprise6": "La surprise ravit.",
-    "coincidence3": "La coincidence amuse.",
-    "destin3": "Le destin guide.",
-    "chance3": "La chance arrive.",
-    "malchance3": "La malchance passe.",
-    "miracle3": "Le miracle arrive.",
-    "magie3": "La magie opere.",
-    "fantasie3": "Le fantasme reve.",
-    "reve3": "Le reve guide.",
-    "cauchemar3": "Le cauchemar finit.",
-    "imagination4": "L'imagination cree.",
-    "creativite4": "La creativite innove.",
-    "innovation4": "L'innovation cree.",
-    "invention3": "L'invention cree.",
-    "decouverte3": "La decouverte revele.",
-    "exploration3": "L'exploration decouvre.",
-    "aventure3": "L'aventure commence.",
-    "voyage6": "Le voyage continue.",
-    "tourisme3": "Le tourisme explore.",
-    "vacances3": "Les vacances reposent.",
-    "loisir3": "Le loisir amuse.",
-    "divertissement3": "Le divertissement amuse.",
-    "jeu3": "Le jeu fascine.",
-    "sport4": "Le sport forme.",
-    "culture6": "La culture enricht.",
-    "art4": "L'art cree.",
-    "musique4": "La musique enchante.",
-    "cinema4": "Le cinema transporte.",
-    "theatre4": "Le theatre emotionne.",
-    "danse4": "La danse ravit.",
-    "photo4": "La photo fige.",
-    "cuisine4": "La cuisine savoure.",
-    "voyage7": "Le voyage enrichit.",
-    "nature4": "La nature guerit.",
-    "environnement4": "L'environnement protege.",
-    "climat4": "Le climat se rechauffe.",
-    "energie4": "L'energie se transforme.",
-    "ecologie4": "L'ecologie gagne.",
-    "recyclage4": "Le recyclage se developpe.",
-    "durabilite4": "La durabilite s'impose.",
-    "developpement durable4": "Le DD progresse.",
-    "energie renouvelable4": "L'ER se developpe.",
-    "solaire4": "Le solaire explose.",
-    "eolien4": "L'eolien grandit.",
-    "hydraulique4": "L'hydraulique se developpe.",
-    "nucleaire4": "Le nucleaire debat.",
-    "fossile4": "Les fossiles diminuent.",
-    "carbonne4": "Le carbone augmente.",
-    "emission4": "Les emissions baissent.",
-    "pollution4": "La pollution diminue.",
-    "deforestation4": "La deforestation ralentit.",
-    "biodiversite4": "La biodiversite se protege.",
-    "espece menacee4": "Les especes menacentes se protegent.",
-    "extinction4": "L'extinction se ralentit.",
-    "conservation4": "La conservation se developpe.",
-    "protection4": "La protection se renforce.",
-    "prevention4": "La prevention se developpe.",
-    "sensibilisation4": "La sensibilisation augmente.",
-    "education4": "L'education se democratise.",
-    "culture7": "La culture se diffuse.",
-    "savoir4": "Le savoir se partage.",
-    "connaissance4": "La connaissance se developpe.",
-    "sagesse4": "La sagesse se transmet.",
-    "verite4": "La verite se decouvre.",
-    "mensonge4": "Le mensonge se decouvre.",
-    "confiance8": "La confiance se b\u00e2tit.",
-    "honte4": "La honte se dissipe.",
-    "fierte4": "La fierte grandit.",
-    "joie4": "La joie se partage.",
-    "tristesse4": "La tristesse se dissippe.",
-    "colere4": "La colere se calme.",
-    "peur4": "La peur se dompte.",
-    "surprise7": "La surprise enchante.",
-    "degout4": "Le degout se transforme.",
-    "ennui4": "L'ennui se dissipe.",
-    "curiosite5": "La curiosite se satisfait.",
-    "espoir4": "L'espoir se renforce.",
-    "desespoir4": "Le desespoir se dissipe.",
-    "confiance9": "La confiance se renforce.",
-    "doute4": "Le doute se leve.",
-    "certitude4": "La certitude se confirme.",
-    "evidence4": "L'evidence s'impose.",
-    "mystere4": "Le mystere se resout.",
-    "secret4": "Le secret se revele.",
-    "surprise8": "La surprise est joyeuse.",
-    "coincidence4": "La coincidence est amusante.",
-    "destin4": "Le destin se decouvre.",
-    "chance4": "La chance est au rendez-vous.",
-    "malchance4": "La malchance se dissipe.",
-    "miracle4": "Le miracle est la.",
-    "magie4": "La magie opere.",
-    "fantasie4": "Le fantasme se realise.",
-    "reve4": "Le reve se realise.",
-    "cauchemar4": "Le cauchemar se dissipe.",
+FAST_KEYS = sorted(FAST_RESPONSES.keys(), key=len, reverse=True)
+_WORD_INDEX = {}
+for _key in FAST_RESPONSES:
+    for _word in _key.split():
+        _WORD_INDEX.setdefault(_word, []).append(_key)
+
+
+def get_fast_response(message):
+    resp = FAST_RESPONSES.get(message)
+    if resp is not None:
+        return resp
+    for key in FAST_KEYS:
+        if key in message:
+            return FAST_RESPONSES[key]
+    for word in message.split():
+        candidates = _WORD_INDEX.get(word)
+        if candidates:
+            return FAST_RESPONSES[max(candidates, key=len)]
+    return None
+
+
+# =====================================================================
+#  IMAGE DETECTION
+# =====================================================================
+IMAGE_PATTERNS = [
+    "generer une image", "generer image", "genere une image", "genere image",
+    "creer une image", "creer image", "cree une image", "cree image",
+    "create an image", "make an image", "generate an image",
+    "une image de", "une image d'un", "une image d'une",
+    "image de", "image d'un", "image d'une",
+    "photo de", "photo d'un", "photo d'une",
+    "dessin de", "dessin d'un", "dessin d'une",
+    "illustration de", "illustration d'un",
+    "peins moi", "dessine moi", "montre moi une image",
+]
+
+
+def is_image_request(message):
+    msg = message.lower().strip()
+    for pat in IMAGE_PATTERNS:
+        if pat in msg:
+            return True
+    return False
+
+
+def extract_image_prompt(message):
+    msg = message.lower().strip()
+    for pat in sorted(IMAGE_PATTERNS, key=len, reverse=True):
+        if pat in msg:
+            idx = msg.index(pat) + len(pat)
+            rest = message[idx:].strip()
+            for prefix in [" de ", " d'un ", " d'une ", " d'"]:
+                rest = rest.replace(prefix, " ", 1)
+            for prefix in ["de ", "d'un ", "d'une ", "d'"]:
+                if rest.startswith(prefix):
+                    rest = rest[len(prefix):]
+            rest = rest.strip().strip("'").strip('"').strip(".")
+            if len(rest) >= 2:
+                return rest
+    return message.strip()
+
+
+# =====================================================================
+#  MUSIC DETECTION
+# =====================================================================
+MUSIC_PATTERNS = [
+    "generer une musique", "generer de la musique", "genere une musique",
+    "creer une musique", "creer de la musique", "cree une musique",
+    "compose une musique", "compose de la musique",
+    "generer une chanson", "creer une chanson",
+    "je veux de la musique", "j'aimerais de la musique",
+    "musique pour", "chanson pour", "melodie pour",
+]
+
+
+def is_music_request(message):
+    msg = message.lower().strip()
+    for pat in MUSIC_PATTERNS:
+        if pat in msg:
+            return True
+    return False
+
+
+def extract_music_prompt(message):
+    msg = message.lower().strip()
+    for pat in sorted(MUSIC_PATTERNS, key=len, reverse=True):
+        if pat in msg:
+            idx = msg.index(pat) + len(pat)
+            rest = message[idx:].strip()
+            for prefix in [" de ", " d'un ", " d'une ", " d'"]:
+                rest = rest.replace(prefix, " ", 1)
+            for prefix in ["de ", "d'un ", "d'une ", "d'"]:
+                if rest.startswith(prefix):
+                    rest = rest[len(prefix):]
+            rest = rest.strip().strip("'").strip('"').strip(".")
+            if len(rest) >= 2:
+                return rest
+    return message.strip() if message.strip() else "calm ambient music"
+
+
+# =====================================================================
+#  CONVERSATION STORE
+# =====================================================================
+conversations = {}
+
+
+# =====================================================================
+#  CORRECTION DETECTION
+# =====================================================================
+CORRECTION_PATTERNS = [
+    "c'est faux", "c'est incorrect", "non", "pas du tout",
+    "c'est pas ca", "c'est pas vrai", "c'est faux",
+    "tu as tort", "c'est mal", "faux",
+    "correction", "en fait c'est", "en realite",
+]
+
+
+def is_correction(message):
+    msg = message.lower().strip()
+    for pat in CORRECTION_PATTERNS:
+        if pat in msg:
+            return True
+    return False
+
+
+# =====================================================================
+#  PWA ICONS GENERATION
+# =====================================================================
+def generate_pwa_icons():
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        for size in [192, 512]:
+            img = Image.new("RGB", (size, size), (99, 102, 241))
+            draw = ImageDraw.Draw(img)
+            try:
+                font = ImageFont.truetype("arial.ttf", size // 2)
+            except Exception:
+                font = ImageFont.load_default()
+            bbox = draw.textbbox((0, 0), "E", font=font)
+            w = bbox[2] - bbox[0]
+            h = bbox[3] - bbox[1]
+            draw.text(((size - w) // 2, (size - h) // 2 - bbox[1]), "E", fill="white", font=font)
+            img.save(os.path.join(GENERATED_DIR, f"icon-{size}.png"))
+        print("PWA icons generated.")
+    except Exception as e:
+        print(f"Icon generation error: {e}")
+
+
+# =====================================================================
+#  HTML TEMPLATE
+# =====================================================================
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>ELLIOTT - IA Ultime</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>">
+<meta name="theme-color" content="#6366f1">
+<meta name="description" content="ELLIOTT - Assistant IA ultime: Chat, Images, Musique, Vision, Code">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ELLIOTT">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon/192.png">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#06060a;--bgc:#0f0f15;--bgh:#1a1a24;--bd:#1e1e2e;
+  --tx:#e8e8f0;--txd:#6b6b80;--txdd:#4a4a5e;
+  --ac:#6366f1;--ach:#818cf8;--acg:rgba(99,102,241,.15);
+  --bl:#3b82f6;--gn:#22c55e;--rd:#ef4444;--pp:#a855f7;
+  --or:#f97316;--cy:#06b6d4;
+  --r:12px;--r2:16px;
+  --glow:0 0 20px rgba(99,102,241,.3);
+  --glow-sm:0 0 10px rgba(99,102,241,.2);
+}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;display:flex;overflow:hidden}
+::selection{background:var(--ac);color:#fff}
+::-webkit-scrollbar{width:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--bd);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--txdd)}
+
+.sidebar{width:280px;background:var(--bgc);border-right:1px solid var(--bd);display:flex;flex-direction:column;height:100vh;position:fixed;left:0;top:0;z-index:10;transition:transform .3s}
+.sidebar-header{padding:20px;border-bottom:1px solid var(--bd)}
+.logo{display:flex;align-items:center;gap:12px}
+.logo-icon{width:44px;height:44px;background:linear-gradient(135deg,var(--ac),var(--pp));border-radius:12px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px;color:#fff;box-shadow:var(--glow-sm)}
+.logo-text{font-size:18px;font-weight:700;background:linear-gradient(135deg,var(--ac),var(--pp));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.logo-sub{font-size:11px;color:var(--txd);margin-top:2px}
+.menu{flex:1;padding:12px;overflow-y:auto}
+.menu-title{font-size:10px;font-weight:600;color:var(--txdd);text-transform:uppercase;letter-spacing:1px;padding:8px 12px;margin-top:8px}
+.menu-item{display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:var(--r);cursor:pointer;transition:all .2s;color:var(--txd);font-size:13px;font-weight:500;border:1px solid transparent}
+.menu-item:hover{background:var(--acg);color:var(--tx);border-color:rgba(99,102,241,.2)}
+.menu-item.active{background:var(--acg);color:var(--ac);border-color:rgba(99,102,241,.3);box-shadow:var(--glow-sm)}
+.menu-item svg{width:18px;height:18px;flex-shrink:0}
+.sidebar-footer{padding:14px;border-top:1px solid var(--bd)}
+.status{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--gn)}
+.status-dot{width:7px;height:7px;background:var(--gn);border-radius:50%;animation:pulse 2s infinite;box-shadow:0 0 6px var(--gn)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+.main{flex:1;margin-left:280px;display:flex;flex-direction:column;height:100vh}
+.header{padding:14px 24px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;background:rgba(15,15,21,.8);backdrop-filter:blur(20px);position:sticky;top:0;z-index:5}
+.header-left{display:flex;align-items:center;gap:12px}
+.header-title{font-size:15px;font-weight:600}
+.header-subtitle{font-size:11px;color:var(--txd)}
+.header-actions{display:flex;gap:6px;align-items:center}
+.header-btn{width:34px;height:34px;border-radius:8px;border:1px solid var(--bd);background:transparent;color:var(--txd);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .2s}
+.header-btn:hover{background:var(--acg);color:var(--ac);border-color:rgba(99,102,241,.3)}
+.header-btn.active{background:var(--ac);color:#fff;border-color:var(--ac);box-shadow:var(--glow-sm)}
+.header-btn svg{width:16px;height:16px}
+
+.chat{flex:1;overflow-y:auto;padding:24px;display:flex;flex-direction:column;gap:16px;scroll-behavior:smooth}
+.message{display:flex;gap:10px;max-width:80%;animation:fadeIn .3s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+.message.user{align-self:flex-end;flex-direction:row-reverse}
+.message-avatar{width:34px;height:34px;border-radius:10px;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:13px;font-weight:600}
+.message.user .message-avatar{background:linear-gradient(135deg,var(--bl),var(--cy))}
+.message.assistant .message-avatar{background:linear-gradient(135deg,var(--ac),var(--pp));box-shadow:var(--glow-sm)}
+.message-avatar svg{width:16px;height:16px}
+.message-content{background:var(--bgc);padding:14px 18px;border-radius:var(--r2);line-height:1.7;font-size:14px;border:1px solid var(--bd);position:relative}
+.message.user .message-content{background:linear-gradient(135deg,rgba(59,130,246,.15),rgba(6,182,212,.1));border-color:rgba(59,130,246,.2)}
+.message-content strong{color:var(--ac)}
+.message.user .message-content strong{color:var(--cy)}
+.message-content code{background:var(--bgh);padding:2px 6px;border-radius:4px;font-family:"Fira Code",monospace;font-size:13px;color:var(--cy)}
+.message-content pre{background:var(--bgh);padding:14px;border-radius:var(--r);overflow-x:auto;margin:10px 0;border:1px solid var(--bd)}
+.message-content pre code{background:0 0;padding:0;color:var(--tx)}
+.message-content img{max-width:100%;border-radius:var(--r);margin:8px 0;border:1px solid var(--bd)}
+.message-content h1,.message-content h2,.message-content h3{color:var(--ac);margin:12px 0 6px}
+
+.msg-actions{display:flex;gap:4px;margin-top:8px;flex-wrap:wrap}
+.msg-action-btn{width:30px;height:30px;border-radius:8px;border:1px solid var(--bd);background:transparent;color:var(--txd);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .2s}
+.msg-action-btn:hover{background:var(--acg);color:var(--ac);border-color:rgba(99,102,241,.3)}
+.msg-action-btn.liked{background:rgba(34,197,94,.15);color:var(--gn);border-color:var(--gn)}
+.msg-action-btn.disliked{background:rgba(239,68,68,.15);color:var(--rd);border-color:var(--rd)}
+.msg-action-btn svg{width:13px;height:13px}
+
+.confidence-bar{height:3px;background:var(--bd);border-radius:2px;margin-top:8px;overflow:hidden}
+.confidence-fill{height:100%;border-radius:2px;transition:width .5s ease}
+.confidence-high{background:linear-gradient(90deg,var(--gn),var(--cy))}
+.confidence-medium{background:linear-gradient(90deg,var(--or),var(--or))}
+.confidence-low{background:linear-gradient(90deg,var(--rd),var(--pp))}
+
+.typing{display:flex;gap:5px;padding:6px 0}
+.typing-dot{width:7px;height:7px;background:var(--ac);border-radius:50%;animation:typingBounce 1.4s infinite ease-in-out}
+.typing-dot:nth-child(2){animation-delay:.2s}
+.typing-dot:nth-child(3){animation-delay:.4s}
+@keyframes typingBounce{0%,80%,100%{transform:scale(.5);opacity:.3}40%{transform:scale(1);opacity:1}}
+.ai-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:10px;font-size:9px;font-weight:600;margin-top:6px;background:var(--acg);color:var(--ac);border:1px solid rgba(99,102,241,.2)}
+.search-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:10px;font-size:9px;font-weight:600;margin-top:4px;background:rgba(59,130,246,.15);color:var(--bl);border:1px solid rgba(59,130,246,.2)}
+
+.suggestions{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.suggestion{padding:6px 12px;background:var(--bgh);border:1px solid var(--bd);border-radius:20px;font-size:12px;color:var(--txd);cursor:pointer;transition:all .2s}
+.suggestion:hover{background:var(--acg);color:var(--ac);border-color:rgba(99,102,241,.3)}
+
+.input-container{padding:16px 24px 24px;background:linear-gradient(to top,var(--bg),transparent)}
+.input-wrapper{display:flex;gap:6px;background:var(--bgc);border:1px solid var(--bd);border-radius:var(--r2);padding:6px;transition:all .2s}
+.input-wrapper:focus-within{border-color:var(--ac);box-shadow:var(--glow-sm)}
+.chat-input{flex:1;background:transparent;border:none;padding:10px 14px;color:var(--tx);font-size:14px;font-family:inherit;outline:0;min-width:0}
+.chat-input::placeholder{color:var(--txdd)}
+.action-btn{width:42px;height:42px;border-radius:var(--r);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .2s;background:var(--bgh);color:var(--txd);border:1px solid var(--bd)}
+.action-btn:hover{color:var(--tx);border-color:var(--ac);background:var(--acg)}
+.action-btn svg{width:18px;height:18px}
+.send-btn{background:linear-gradient(135deg,var(--ac),var(--pp));color:#fff;border:none;box-shadow:var(--glow-sm)}
+.send-btn:hover{transform:scale(1.05);box-shadow:var(--glow)}
+.mic-btn.recording{background:var(--rd);color:#fff;border-color:var(--rd);animation:micPulse 1s infinite}
+@keyframes micPulse{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,.5)}50%{box-shadow:0 0 0 8px rgba(239,68,68,0)}}
+
+.welcome{text-align:center;padding:60px 24px;max-width:600px;margin:0 auto;width:100%}
+.welcome-icon{width:80px;height:80px;background:linear-gradient(135deg,var(--ac),var(--pp));border-radius:20px;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;box-shadow:var(--glow)}
+.welcome-icon svg{width:40px;height:40px}
+.welcome h2{font-size:22px;margin-bottom:6px;background:linear-gradient(135deg,var(--tx),var(--ac));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.welcome p{color:var(--txd);margin-bottom:24px;font-size:14px}
+.welcome-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.welcome-card{background:var(--bgc);border:1px solid var(--bd);border-radius:var(--r2);padding:18px 14px;cursor:pointer;transition:all .25s}
+.welcome-card:hover{border-color:var(--ac);transform:translateY(-3px);box-shadow:var(--glow-sm)}
+.welcome-card-icon{width:38px;height:38px;background:var(--acg);border-radius:10px;display:flex;align-items:center;justify-content:center;margin:0 auto 10px}
+.welcome-card-icon svg{width:18px;height:18px;color:var(--ac)}
+.welcome-card h4{font-size:13px;margin-bottom:3px}
+.welcome-card p{font-size:11px;color:var(--txd);margin:0}
+
+.dashboard{display:none;padding:24px;overflow-y:auto;flex:1}
+.dashboard.visible{display:block}
+.dash-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}
+.dash-card{background:var(--bgc);border:1px solid var(--bd);border-radius:var(--r2);padding:20px;text-align:center;transition:all .2s}
+.dash-card:hover{border-color:var(--ac);box-shadow:var(--glow-sm)}
+.dash-num{font-size:28px;font-weight:700;background:linear-gradient(135deg,var(--ac),var(--pp));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.dash-label{font-size:11px;color:var(--txd);margin-top:4px;text-transform:uppercase;letter-spacing:.5px}
+.dash-section{background:var(--bgc);border:1px solid var(--bd);border-radius:var(--r2);padding:20px;margin-bottom:16px}
+.dash-section h3{font-size:14px;margin-bottom:12px;color:var(--ac)}
+.topic-bar{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.topic-name{font-size:12px;color:var(--txd);min-width:120px}
+.topic-fill-bg{flex:1;height:6px;background:var(--bd);border-radius:3px;overflow:hidden}
+.topic-fill{height:100%;background:linear-gradient(90deg,var(--ac),var(--pp));border-radius:3px;transition:width .5s}
+.topic-count{font-size:11px;color:var(--txdd);min-width:30px;text-align:right}
+
+.correction-item{padding:10px;border:1px solid var(--bd);border-radius:var(--r);margin-bottom:8px;font-size:12px}
+.correction-item .orig{color:var(--rd);text-decoration:line-through}
+.correction-item .corr{color:var(--gn)}
+.correction-item .corr-time{color:var(--txdd);font-size:10px;margin-top:4px}
+
+.tool-panel{max-width:700px;margin:0 auto}
+.tool-panel h2{font-size:18px;margin-bottom:16px;background:linear-gradient(135deg,var(--ac),var(--pp));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.tool-input{width:100%;padding:12px 16px;background:var(--bgh);border:1px solid var(--bd);border-radius:var(--r);color:var(--tx);font-size:14px;font-family:inherit;outline:0;margin-bottom:12px;transition:all .2s}
+.tool-input:focus{border-color:var(--ac);box-shadow:var(--glow-sm)}
+textarea.tool-input{min-height:200px;resize:vertical;font-family:"Fira Code",Consolas,monospace;font-size:13px;line-height:1.5}
+.tool-btn{padding:10px 20px;background:linear-gradient(135deg,var(--ac),var(--pp));color:#fff;border:none;border-radius:var(--r);cursor:pointer;font-size:14px;font-weight:600;transition:all .2s;display:inline-flex;align-items:center;gap:8px}
+.tool-btn:hover{transform:translateY(-1px);box-shadow:var(--glow)}
+.tool-btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.tool-btn svg{width:16px;height:16px}
+.tool-result{margin-top:16px;padding:16px;background:var(--bgh);border:1px solid var(--bd);border-radius:var(--r);font-family:"Fira Code",monospace;font-size:13px;white-space:pre-wrap;max-height:400px;overflow-y:auto;line-height:1.5}
+.tool-result.success{border-color:var(--gn);color:var(--gn)}
+.tool-result.error{border-color:var(--rd);color:var(--rd)}
+.tool-hint{font-size:12px;color:var(--txd);margin-bottom:12px}
+.tool-row{display:flex;gap:8px;align-items:center;margin-bottom:12px}
+
+.music-player{margin-top:12px;padding:12px;background:var(--bgh);border:1px solid var(--bd);border-radius:var(--r)}
+.music-player audio{width:100%;height:36px}
+
+@keyframes glowPulse{0%,100%{box-shadow:var(--glow-sm)}50%{box-shadow:var(--glow)}}
+.glow-animate{animation:glowPulse 3s infinite}
+
+.install-btn{padding:6px 12px;background:linear-gradient(135deg,var(--gn),var(--cy));color:#fff;border:none;border-radius:var(--r);cursor:pointer;font-size:12px;font-weight:600;display:none;align-items:center;gap:4px}
+.install-btn:hover{transform:scale(1.05)}
+
+@media(max-width:768px){
+  .sidebar{transform:translateX(-100%)}
+  .sidebar.open{transform:translateX(0)}
+  .main{margin-left:0}
+  .message{max-width:95%}
+  .welcome-grid{grid-template-columns:1fr}
+  .dash-grid{grid-template-columns:repeat(2,1fr)}
+}
+</style>
+</head>
+<body>
+
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <div class="logo">
+      <div class="logo-icon glow-animate">E</div>
+      <div><div class="logo-text">ELLIOTT</div><div class="logo-sub">IA Ultime</div></div>
+    </div>
+  </div>
+  <nav class="menu">
+    <div class="menu-title">Navigation</div>
+    <div class="menu-item active" onclick="showView('chat',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      Chat IA
+    </div>
+    <div class="menu-item" onclick="showView('dashboard',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+      Tableau de bord
+    </div>
+
+    <div class="menu-title">Outils IA</div>
+    <div class="menu-item" onclick="sendImage()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+      Generer Image
+    </div>
+    <div class="menu-item" onclick="showView('music',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+      Generer Musique
+    </div>
+    <div class="menu-item" onclick="showView('code',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+      Editeur de Code
+    </div>
+    <div class="menu-item" onclick="showView('vision',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+      Analyser Image
+    </div>
+    <div class="menu-item" onclick="showView('search',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      Recherche Web
+    </div>
+
+    <div class="menu-title">Sujets Populaires</div>
+    <div class="menu-item" onclick="sendQuick('Explique le machine learning simplement')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+      IA / ML
+    </div>
+    <div class="menu-item" onclick="sendQuick('Ecris un script Python elegant pour fibonacci')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+      Python
+    </div>
+    <div class="menu-item" onclick="sendQuick('Conseils pour debuter en tricot')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+      Artisanat
+    </div>
+    <div class="menu-item" onclick="sendQuick('Raconte-moi une histoire courte et fascinante')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+      Histoire
+    </div>
+  </nav>
+  <div class="sidebar-footer">
+    <div class="status">
+      <div class="status-dot"></div>
+      <span id="statusText">En ligne</span>
+    </div>
+  </div>
+</aside>
+
+<main class="main">
+  <header class="header">
+    <div class="header-left">
+      <button class="header-btn" id="menuToggle" onclick="toggleSidebar()" style="display:none">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <div>
+        <div class="header-title">ELLIOTT <span class="ai-badge">100% Gratuit</span></div>
+        <div class="header-subtitle" id="headerSubtitle">Pret a discuter</div>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button class="install-btn" id="installBtn" onclick="installPWA()" title="Installer l'app">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Installer
+      </button>
+      <button class="header-btn active" id="autoSpeakBtn" onclick="toggleAutoSpeak()" title="Parler auto (ON)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+      </button>
+      <button class="header-btn" onclick="clearChat()" title="Nouvelle conversation">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+      <button class="header-btn" onclick="loadDashboard()" title="Memoire">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="chat" id="chatMessages">
+    <div class="welcome" id="welcomeScreen">
+      <div class="welcome-icon glow-animate">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+      </div>
+      <h2>Bonjour! Je suis ELLIOTT</h2>
+      <p>IA <strong>revolutionnaire</strong> qui apprend, retient et s'ameliore!</p>
+      <div class="welcome-grid">
+        <div class="welcome-card" onclick="sendQuick('Explique le machine learning simplement')">
+          <div class="welcome-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg></div>
+          <h4>Apprendre</h4><p>ML, code, sciences</p>
+        </div>
+        <div class="welcome-card" onclick="sendImage()">
+          <div class="welcome-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg></div>
+          <h4>Creer</h4><p>Images magiques</p>
+        </div>
+        <div class="welcome-card" onclick="showView('music',document.querySelectorAll('.menu-item')[3])">
+          <div class="welcome-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>
+          <h4>Musique</h4><p>Generez de la musique</p>
+        </div>
+        <div class="welcome-card" onclick="showView('code',document.querySelectorAll('.menu-item')[5])">
+          <div class="welcome-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div>
+          <h4>Code</h4><p>Executer du Python</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="dashboard" id="dashboardView">
+    <div class="dash-grid">
+      <div class="dash-card"><div class="dash-num" id="dConv">0</div><div class="dash-label">Conversations</div></div>
+      <div class="dash-card"><div class="dash-num" id="dTopics">0</div><div class="dash-label">Sujets Appris</div></div>
+      <div class="dash-card"><div class="dash-num" id="dCorr">0</div><div class="dash-label">Corrections</div></div>
+      <div class="dash-card"><div class="dash-num" id="dThumbs">0</div><div class="dash-label">Appreciations</div></div>
+      <div class="dash-card"><div class="dash-num" id="dImages">0</div><div class="dash-label">Images</div></div>
+      <div class="dash-card"><div class="dash-num" id="dMusic">0</div><div class="dash-label">Musiques</div></div>
+      <div class="dash-card"><div class="dash-num" id="dCode">0</div><div class="dash-label">Code Execute</div></div>
+      <div class="dash-card"><div class="dash-num" id="dSearch">0</div><div class="dash-label">Recherches</div></div>
+      <div class="dash-card"><div class="dash-num" id="dQuality">0%</div><div class="dash-label">Qualite Moy.</div></div>
+      <div class="dash-card"><div class="dash-num" id="dUptime">0m</div><div class="dash-label">Temps Actif</div></div>
+    </div>
+    <div class="dash-section">
+      <h3>Sujets les plus demandes</h3>
+      <div id="topicsList"></div>
+    </div>
+    <div class="dash-section">
+      <h3>Corrections recentes</h3>
+      <div id="correctionsList"></div>
+    </div>
+    <div class="dash-section">
+      <h3>Resumes de conversations passees</h3>
+      <div id="summariesList"></div>
+    </div>
+  </div>
+
+  <div class="dashboard" id="musicView">
+    <div class="tool-panel">
+      <h2>Generateur de Musique IA</h2>
+      <p class="tool-hint">Decrivez la musique que vous souhaitez et ELLIOTT la generera pour vous avec MusicGen.</p>
+      <input type="text" class="tool-input" id="musicPrompt" placeholder="Ex: musique electronique rythmique et energisante..." maxlength="500" onkeypress="if(event.key==='Enter')generateMusic()">
+      <button class="tool-btn" id="musicGenBtn" onclick="generateMusic()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        Generer la Musique
+      </button>
+      <div id="musicResult"></div>
+    </div>
+  </div>
+
+  <div class="dashboard" id="codeView">
+    <div class="tool-panel">
+      <h2>Editeur de Code Python</h2>
+      <p class="tool-hint">Ecrivez du Python et executer-le directement. Le code est execute dans un environnement securise avec timeout.</p>
+      <textarea class="tool-input" id="codeEditor" placeholder="# Ecrivez votre code Python ici...&#10;print('Bonjour ELLIOTT!')" spellcheck="false"></textarea>
+      <div class="tool-row">
+        <button class="tool-btn" id="execBtn" onclick="executeCode()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          Executer
+        </button>
+        <button class="tool-btn" onclick="document.getElementById('codeEditor').value=''" style="background:var(--bgh);color:var(--txd)">
+          Effacer
+        </button>
+      </div>
+      <div id="codeResult"></div>
+    </div>
+  </div>
+
+  <div class="dashboard" id="visionView">
+    <div class="tool-panel">
+      <h2>Analyse d'Image (Vision IA)</h2>
+      <p class="tool-hint">Envoyez une URL d'image ou uploadez un fichier pour l'analyser avec l'intelligence artificielle.</p>
+      <input type="text" class="tool-input" id="imageUrlInput" placeholder="Collez une URL d'image ici..." maxlength="2000" onkeypress="if(event.key==='Enter')analyzeImageUrl()">
+      <div class="tool-row">
+        <button class="tool-btn" onclick="analyzeImageUrl()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          Analyser l'URL
+        </button>
+        <label class="tool-btn" style="cursor:pointer;background:var(--bgh);color:var(--txd)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          Uploader un fichier
+          <input type="file" accept="image/*" onchange="handleImageUpload(event)" style="display:none">
+        </label>
+      </div>
+      <div id="visionResult"></div>
+    </div>
+  </div>
+
+  <div class="dashboard" id="searchView">
+    <div class="tool-panel">
+      <h2>Recherche Web</h2>
+      <p class="tool-hint">Recherchez sur internet. Les resultats sont utilises pour enrichir les reponses de l'IA.</p>
+      <input type="text" class="tool-input" id="searchInput" placeholder="Tapez votre recherche..." maxlength="500" onkeypress="if(event.key==='Enter')doWebSearch()">
+      <button class="tool-btn" onclick="doWebSearch()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        Rechercher
+      </button>
+      <div id="searchResults" style="margin-top:16px"></div>
+    </div>
+  </div>
+
+  <div class="input-container">
+    <div class="input-wrapper">
+      <button class="action-btn mic-btn" id="micBtn" onclick="toggleMic()" title="Micro">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+      </button>
+      <input type="text" class="chat-input" id="chatInput" placeholder="Tapez ou dites votre question..." maxlength="2000" onkeypress="if(event.key==='Enter')sendMessage()">
+      <button class="action-btn" onclick="sendImage()" title="Generer image">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+      </button>
+      <button class="action-btn" onclick="showView('music',document.querySelectorAll('.menu-item')[3])" title="Generer musique">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+      </button>
+      <button class="action-btn send-btn" onclick="sendMessage()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+      </button>
+    </div>
+  </div>
+</main>
+
+<script>
+var convId='c_'+Date.now();
+var synth=window.speechSynthesis;
+var autoSpeak=true;
+var recognition=null;
+var isRecording=false;
+var SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
+var startTime=Date.now();
+var pendingFeedback={};
+var msgCount=0;
+
+if(SpeechRecognition){
+  recognition=new SpeechRecognition();
+  recognition.continuous=false;
+  recognition.interimResults=true;
+  recognition.lang='fr-FR';
+  recognition.onresult=function(e){
+    var t='';
+    for(var i=e.resultIndex;i<e.results.length;i++){t+=e.results[i][0].transcript;}
+    document.getElementById('chatInput').value=t;
+  };
+  recognition.onend=function(){
+    isRecording=false;
+    document.getElementById('micBtn').classList.remove('recording');
+    var msg=document.getElementById('chatInput').value.trim();
+    if(msg)sendMessage();
+  };
+  recognition.onerror=function(){
+    isRecording=false;
+    document.getElementById('micBtn').classList.remove('recording');
+  };
 }
 
-# Cache pour reponses rapides
-response_cache = {}
+function toggleAutoSpeak(){
+  autoSpeak=!autoSpeak;
+  document.getElementById('autoSpeakBtn').classList.toggle('active',autoSpeak);
+}
+
+function toggleMic(){
+  if(!recognition){alert('Reconnaissance vocale non supportee.');return;}
+  if(isRecording){recognition.stop();isRecording=false;document.getElementById('micBtn').classList.remove('recording');}
+  else{synth.cancel();recognition.start();isRecording=true;document.getElementById('micBtn').classList.add('recording');}
+}
+
+function toggleSidebar(){document.getElementById('sidebar').classList.toggle('open');}
+
+function showView(view,el){
+  document.querySelectorAll('.menu-item').forEach(function(i){i.classList.remove('active')});
+  if(el)el.classList.add('active');
+  var views=['chatMessages','dashboardView','musicView','codeView','visionView','searchView'];
+  var viewMap={chat:'chatMessages',dashboard:'dashboardView',music:'musicView',code:'codeView',vision:'visionView',search:'searchView'};
+  views.forEach(function(v){
+    var e=document.getElementById(v);
+    if(v==='chatMessages'){e.style.display='none';}
+    else{e.className='dashboard';}
+  });
+  var target=document.getElementById(viewMap[view]);
+  if(view==='chat'){target.style.display='flex';}
+  else{target.className='dashboard visible';}
+  if(view==='dashboard')loadDashboard();
+}
+
+function sendQuick(t){document.getElementById('chatInput').value=t;sendMessage();}
+
+function escapeHtml(s){var d=document.createElement('div');d.appendChild(document.createTextNode(s));return d.innerHTML;}
+
+function formatMarkdown(c){
+  var out=escapeHtml(c);
+  out=out.replace(/```(\w*)\n([\s\S]*?)```/g,function(m,lang,code){return '<pre><code class="lang-'+lang+'">'+code+'</code></pre>';});
+  out=out.replace(/`([^`]+)`/g,'<code>$1</code>');
+  out=out.replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>');
+  out=out.replace(/\*(.*?)\*/g,'<em>$1</em>');
+  out=out.replace(/^### (.+)$/gm,'<h3 style="color:var(--ac)">$1</h3>');
+  out=out.replace(/^## (.+)$/gm,'<h2 style="color:var(--ac);font-size:16px;margin:10px 0 4px">$1</h2>');
+  out=out.replace(/^# (.+)$/gm,'<h1 style="color:var(--ac);font-size:18px;margin:10px 0 4px">$1</h1>');
+  out=out.replace(/^- (.+)$/gm,'<li style="margin-left:16px">$1</li>');
+  out=out.replace(/^\d+\. (.+)$/gm,'<li style="margin-left:16px">$1</li>');
+  out=out.replace(/\n/g,'<br>');
+  return out;
+}
+
+function confidenceClass(conf){
+  if(conf>=0.7)return 'confidence-high';
+  if(conf>=0.4)return 'confidence-medium';
+  return 'confidence-low';
+}
+
+function addMessage(c,u,opts){
+  opts=opts||{};
+  var chat=document.getElementById('chatMessages');
+  var w=document.getElementById('welcomeScreen');
+  if(w)w.remove();
+  var m=document.createElement('div');
+  m.className='message '+(u?'user':'assistant');
+  m.id='msg_'+(++msgCount);
+  var a=u?'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>';
+  var content=u?escapeHtml(c):formatMarkdown(c);
+  var h='<div class="message-avatar">'+a+'</div><div class="message-content">'+content;
+  if(!u&&!opts.noBadge){
+    h+='<div class="ai-badge">ELLIOTT IA</div>';
+    if(opts.searchUsed){h+='<div class="search-badge">Recherche web utilisee</div>';}
+    if(typeof opts.confidence==='number'){
+      h+='<div class="confidence-bar"><div class="confidence-fill '+confidenceClass(opts.confidence)+'" style="width:'+(opts.confidence*100)+'%"></div></div>';
+    }
+    var mid=m.id;
+    h+='<div class="msg-actions">';
+    h+='<button class="msg-action-btn" onclick="speakMsg(\''+mid+'\')" title="Ecouter"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg></button>';
+    h+='<button class="msg-action-btn" onclick="copyMsg(\''+mid+'\')" title="Copier"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>';
+    h+='<button class="msg-action-btn" id="thumbUp_'+mid+'" onclick="sendFeedback(\''+mid+'\',true)" title="Utile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/></svg></button>';
+    h+='<button class="msg-action-btn" id="thumbDn_'+mid+'" onclick="sendFeedback(\''+mid+'\',false)" title="Pas utile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"/></svg></button>';
+    h+='</div>';
+  }
+  h+='</div>';
+  m.innerHTML=h;
+  chat.appendChild(m);
+  chat.scrollTop=chat.scrollHeight;
+  window._lastResponse=c;
+  window._lastResponseEl=m;
+  return m;
+}
+
+function addImageMessage(imgUrl,prompt,text){
+  var chat=document.getElementById('chatMessages');
+  var w=document.getElementById('welcomeScreen');
+  if(w)w.remove();
+  var m=document.createElement('div');
+  m.className='message assistant';
+  var av='<div class="message-avatar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg></div>';
+  var content='<div style="max-width:100%"><img src="'+escapeHtml(imgUrl)+'" alt="'+escapeHtml(prompt)+'" style="max-width:100%;border-radius:12px;display:block;border:1px solid var(--bd)" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'block\'"><div style="color:var(--rd);display:none">Image non chargee.</div>';
+  if(text)content+='<div style="margin-top:8px;color:var(--txd);font-size:13px">'+escapeHtml(text)+'</div>';
+  if(prompt)content+='<div style="margin-top:4px;color:var(--txdd);font-size:11px">Prompt: '+escapeHtml(prompt)+'</div>';
+  content+='</div><div class="ai-badge">ELLIOTT IA</div>';
+  m.innerHTML=av+'<div class="message-content">'+content+'</div>';
+  chat.appendChild(m);
+  chat.scrollTop=chat.scrollHeight;
+}
+
+function addMusicMessage(audioUrl, prompt){
+  var chat=document.getElementById('chatMessages');
+  var w=document.getElementById('welcomeScreen');
+  if(w)w.remove();
+  var m=document.createElement('div');
+  m.className='message assistant';
+  var av='<div class="message-avatar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg></div>';
+  var content='<div style="max-width:100%">';
+  content+='<div style="margin-bottom:8px;color:var(--tx);font-size:14px">🎵 Musique generee: <strong>'+escapeHtml(prompt)+'</strong></div>';
+  content+='<div class="music-player"><audio controls src="'+escapeHtml(audioUrl)+'"></audio></div>';
+  content+='</div><div class="ai-badge">ELLIOTT IA</div>';
+  m.innerHTML=av+'<div class="message-content">'+content+'</div>';
+  chat.appendChild(m);
+  chat.scrollTop=chat.scrollHeight;
+}
+
+function showTyping(t){
+  var chat=document.getElementById('chatMessages');
+  var w=document.getElementById('welcomeScreen');
+  if(w)w.remove();
+  var m=document.createElement('div');
+  m.className='message assistant';
+  m.id='typingMsg';
+  m.innerHTML='<div class="message-avatar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg></div><div class="message-content"><div class="typing"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div><div style="font-size:12px;color:var(--txd);margin-top:4px">'+(t||'Reflexion...')+'</div></div>';
+  chat.appendChild(m);
+  chat.scrollTop=chat.scrollHeight;
+}
+
+function hideTyping(){var t=document.getElementById('typingMsg');if(t)t.remove();}
+
+function speakText(text){
+  if(!text)return;
+  var c=text.replace(/\n/g,' ').replace(/[#\-*>|_\`\[\]]/g,'').replace(/\s+/g,' ').trim();
+  if(!c||c.length<2)return;
+  synth.cancel();
+  var u=new SpeechSynthesisUtterance(c);
+  u.lang='fr-FR';u.rate=1.0;
+  synth.speak(u);
+}
+
+function speakMsg(id){
+  var el=document.getElementById(id);
+  if(!el)return;
+  var content=el.querySelector('.message-content');
+  if(content)speakText(content.innerText);
+}
+
+function speakLast(){if(window._lastResponse)speakText(window._lastResponse);}
+
+function copyMsg(id){
+  var el=document.getElementById(id);
+  if(!el)return;
+  var content=el.querySelector('.message-content');
+  if(content)navigator.clipboard.writeText(content.innerText).catch(function(){});
+}
+
+function copyText(text){if(text)navigator.clipboard.writeText(text).catch(function(){});}
+
+function sendFeedback(msgId,positive){
+  var upBtn=document.getElementById('thumbUp_'+msgId);
+  var dnBtn=document.getElementById('thumbDn_'+msgId);
+  if(upBtn)upBtn.classList.toggle('liked',positive);
+  if(dnBtn)dnBtn.classList.toggle('disliked',!positive);
+  fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({message_id:msgId,positive:positive,conversation_id:convId})});
+}
+
+function sendMessage(){
+  var i=document.getElementById('chatInput');
+  var msg=i.value.trim();
+  if(!msg)return;
+  synth.cancel();
+  addMessage(msg,true);
+  i.value='';
+  var isSearch=needsWebSearchMsg(msg);
+  showTyping(isSearch?'Recherche sur le net...':'Reflexion...');
+  document.getElementById('headerSubtitle').textContent=isSearch?'Recherche...':'En reflexion...';
+  fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({message:msg,conversation_id:convId})})
+  .then(function(r){return r.json()})
+  .then(function(d){
+    hideTyping();
+    document.getElementById('headerSubtitle').textContent='Pret a discuter';
+    if(d.image_url){
+      addImageMessage(d.image_url,d.image_prompt||'',d.text||'Image generee');
+      if(autoSpeak&&d.text)speakText(d.text);
+    }else if(d.music_url){
+      addMusicMessage(d.music_url,d.music_prompt||msg);
+    }else{
+      var conf=typeof d.confidence==='number'?d.confidence:0.8;
+      addMessage(d.text||'Pas de reponse',false,{confidence:conf,searchUsed:d.search_used});
+      if(autoSpeak&&d.text)speakText(d.text);
+    }
+  })
+  .catch(function(){
+    hideTyping();
+    document.getElementById('headerSubtitle').textContent='Pret a discuter';
+    addMessage('Erreur de connexion. Verifiez internet.',false);
+  });
+  i.focus();
+}
+
+function needsWebSearchMsg(msg){
+  var patterns=['quel','quoi','comment','pourquoi','quand','ou est','combien','qui est','definition','explique','actualit','nouveau','prix','meteo','meilleur','compar','2024','2025','2026'];
+  return patterns.some(function(p){return msg.toLowerCase().indexOf(p)!==-1;})&&msg.split(' ').length>3;
+}
+
+function sendImage(){
+  var i=document.getElementById('chatInput');
+  var msg=i.value.trim();
+  if(!msg)msg='Un paysage magique au coucher du soleil';
+  addMessage('Image: '+msg,true);
+  i.value='';
+  showTyping('Generation de l image...');
+  fetch('/api/image',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({prompt:msg})})
+  .then(function(r){return r.json()})
+  .then(function(d){
+    hideTyping();
+    if(d.url){addImageMessage(d.url,msg,'');}
+    else{addMessage('Image non disponible. Verifiez internet.',false);}
+  })
+  .catch(function(){hideTyping();addMessage('Erreur lors de la generation.',false);});
+}
+
+function clearChat(){
+  convId='c_'+Date.now();
+  window._lastResponse='';
+  window._lastResponseEl=null;
+  synth.cancel();
+  var chat=document.getElementById('chatMessages');
+  chat.innerHTML='<div class="welcome" id="welcomeScreen"><div class="welcome-icon glow-animate"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg></div><h2>Bonjour! Je suis ELLIOTT</h2><p>IA <strong>revolutionnaire</strong> qui apprend et s\'ameliore!</p><div class="welcome-grid"><div class="welcome-card" onclick="sendQuick(\'Explique le machine learning simplement\')"><div class="welcome-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg></div><h4>Apprendre</h4><p>ML, code</p></div><div class="welcome-card" onclick="sendImage()"><div class="welcome-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg></div><h4>Creer</h4><p>Images</p></div><div class="welcome-card" onclick="showView(\'music\',document.querySelectorAll(\'.menu-item\')[3])"><div class="welcome-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div><h4>Musique</h4><p>Generez</p></div><div class="welcome-card" onclick="showView(\'code\',document.querySelectorAll(\'.menu-item\')[5])"><div class="welcome-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div><h4>Code</h4><p>Python</p></div></div></div>';
+}
+
+// --- MUSIC ---
+function generateMusic(){
+  var prompt=document.getElementById('musicPrompt').value.trim();
+  if(!prompt){alert('Entrez un descriptif musical.');return;}
+  var btn=document.getElementById('musicGenBtn');
+  btn.disabled=true;btn.innerHTML='<div class="typing" style="display:inline-flex"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div> Generation...';
+  document.getElementById('musicResult').innerHTML='';
+  showView('chat',document.querySelector('.menu-item'));
+  showTyping('Generation musicale en cours...');
+  fetch('/api/music',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({prompt:prompt})})
+  .then(function(r){return r.json()})
+  .then(function(d){
+    hideTyping();btn.disabled=false;btn.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><polygon points="5 3 19 12 5 21 5 3"/></svg> Generer la Musique';
+    if(d.url){addMusicMessage(d.url,prompt);}
+    else{addMessage('Generation musicale echouee. '+ (d.error||''),false);}
+  })
+  .catch(function(){hideTyping();btn.disabled=false;btn.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><polygon points="5 3 19 12 5 21 5 3"/></svg> Generer la Musique';addMessage('Erreur de generation musicale.',false);});
+}
+
+// --- CODE ---
+function executeCode(){
+  var code=document.getElementById('codeEditor').value;
+  if(!code.trim()){alert('Ecrivez du code d abord.');return;}
+  var btn=document.getElementById('execBtn');
+  btn.disabled=true;btn.innerHTML='<div class="typing" style="display:inline-flex"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div> Execution...';
+  document.getElementById('codeResult').innerHTML='';
+  fetch('/api/execute',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({code:code})})
+  .then(function(r){return r.json()})
+  .then(function(d){
+    btn.disabled=false;btn.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><polygon points="5 3 19 12 5 21 5 3"/></svg> Executer';
+    var el=document.getElementById('codeResult');
+    if(d.error){
+      el.className='tool-result error';el.textContent='Erreur: '+d.error;
+    }else{
+      var out='';
+      if(d.stdout)out+='Sortie:\n'+d.stdout;
+      if(d.stderr)out+='\nErreurs:\n'+d.stderr;
+      if(d.returncode===0&&!d.stderr)out='Code execute avec succes!\n'+(d.stdout||'(pas de sortie)');
+      el.className='tool-result '+(d.returncode===0?'success':'error');el.textContent=out||'(pas de sortie)';
+    }
+  })
+  .catch(function(){btn.disabled=false;btn.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><polygon points="5 3 19 12 5 21 5 3"/></svg> Executer';document.getElementById('codeResult').className='tool-result error';document.getElementById('codeResult').textContent='Erreur de communication.';});
+}
+
+// --- VISION ---
+function analyzeImageUrl(){
+  var url=document.getElementById('imageUrlInput').value.trim();
+  if(!url){alert('Entrez une URL d image.');return;}
+  showView('chat',document.querySelector('.menu-item'));
+  showTyping('Analyse de l image...');
+  fetch('/api/vision',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({url:url})})
+  .then(function(r){return r.json()})
+  .then(function(d){
+    hideTyping();
+    if(d.description){
+      var chat=document.getElementById('chatMessages');
+      var w=document.getElementById('welcomeScreen');
+      if(w)w.remove();
+      var m=document.createElement('div');m.className='message assistant';
+      var av='<div class="message-avatar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></div>';
+      var content='<img src="'+escapeHtml(url)+'" style="max-width:300px;border-radius:8px;margin-bottom:8px;border:1px solid var(--bd)"><br><strong>Analyse IA:</strong><br>'+formatMarkdown(d.description);
+      m.innerHTML=av+'<div class="message-content">'+content+'<div class="ai-badge">Vision IA</div></div>';
+      chat.appendChild(m);chat.scrollTop=chat.scrollHeight;
+    }else{addMessage('Analyse non disponible.',false);}
+  })
+  .catch(function(){hideTyping();addMessage("Erreur d'analyse.",false);});
+}
+
+function handleImageUpload(event){
+  var file=event.target.files[0];
+  if(!file)return;
+  var reader=new FileReader();
+  reader.onload=function(e){
+    var b64=e.target.result;
+    showView('chat',document.querySelector('.menu-item'));
+    showTyping('Analyse de l image uploadee...');
+    fetch('/api/vision',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({base64:b64})})
+    .then(function(r){return r.json()})
+    .then(function(d){
+      hideTyping();
+      if(d.description){
+        var chat=document.getElementById('chatMessages');
+        var w=document.getElementById('welcomeScreen');
+        if(w)w.remove();
+        var m=document.createElement('div');m.className='message assistant';
+        var av='<div class="message-avatar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></div>';
+        var content='<img src="'+b64+'" style="max-width:300px;border-radius:8px;margin-bottom:8px;border:1px solid var(--bd)"><br><strong>Analyse IA:</strong><br>'+formatMarkdown(d.description);
+        m.innerHTML=av+'<div class="message-content">'+content+'<div class="ai-badge">Vision IA</div></div>';
+        chat.appendChild(m);chat.scrollTop=chat.scrollHeight;
+      }else{addMessage('Analyse non disponible.',false);}
+    })
+    .catch(function(){hideTyping();addMessage("Erreur d'analyse.",false);});
+  };
+  reader.readAsDataURL(file);
+}
+
+// --- SEARCH ---
+function doWebSearch(){
+  var q=document.getElementById('searchInput').value.trim();
+  if(!q){alert('Entrez une requete de recherche.');return;}
+  var el=document.getElementById('searchResults');
+  el.innerHTML='<div class="tool-hint">Recherche en cours...</div>';
+  fetch('/api/search',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({query:q})})
+  .then(function(r){return r.json()})
+  .then(function(d){
+    if(d.results&&d.results.length>0){
+      var html='';
+      d.results.forEach(function(r,i){
+        html+='<div style="padding:12px;border:1px solid var(--bd);border-radius:var(--r);margin-bottom:8px">';
+        html+='<div style="font-weight:600;color:var(--ac);margin-bottom:4px">'+escapeHtml(r.title)+'</div>';
+        html+='<div style="font-size:12px;color:var(--txd);margin-bottom:4px">'+escapeHtml(r.snippet)+'</div>';
+        if(r.url)html+='<a href="'+escapeHtml(r.url)+'" target="_blank" style="font-size:11px;color:var(--cy);text-decoration:none">'+escapeHtml(r.url)+'</a>';
+        html+='</div>';
+      });
+      el.innerHTML=html;
+    }else{
+      el.innerHTML='<div class="tool-hint">Aucun resultat. Essayez une autre recherche.</div>';
+    }
+  })
+  .catch(function(){el.innerHTML='<div class="tool-hint">Erreur de recherche.</div>';});
+}
+
+// --- DASHBOARD ---
+function loadDashboard(){
+  showView('dashboard',null);
+  fetch('/api/memory').then(function(r){return r.json()}).then(function(d){
+    var s=d.stats||{};
+    document.getElementById('dConv').textContent=s.total_conversations||0;
+    document.getElementById('dTopics').textContent=s.topics_learned||0;
+    document.getElementById('dCorr').textContent=s.corrections_made||0;
+    var thumbs=(s.thumbs_up||0)+(s.thumbs_down||0);
+    document.getElementById('dThumbs').textContent=thumbs;
+    document.getElementById('dImages').textContent=s.images_generated||0;
+    document.getElementById('dMusic').textContent=s.music_generated||0;
+    document.getElementById('dCode').textContent=s.code_executed||0;
+    document.getElementById('dSearch').textContent=s.searches_performed||0;
+    var avgQ=s.quality_score_avg||0;
+    document.getElementById('dQuality').textContent=Math.round(avgQ*100)+'%';
+    var upMs=Date.now()-startTime;
+    var mins=Math.floor(upMs/60000);
+    if(mins>60)document.getElementById('dUptime').textContent=Math.floor(mins/60)+'h'+(mins%60)+'m';
+    else document.getElementById('dUptime').textContent=mins+'m';
+
+    var topicsDiv=document.getElementById('topicsList');
+    topicsDiv.innerHTML='';
+    var topics=d.topics||{};
+    var sorted=Object.entries(topics).sort(function(a,b){return b[1]-a[1]}).slice(0,10);
+    var maxCount=sorted.length>0?sorted[0][1]:1;
+    sorted.forEach(function(t){
+      var pct=Math.round((t[1]/maxCount)*100);
+      topicsDiv.innerHTML+='<div class="topic-bar"><div class="topic-name">'+escapeHtml(t[0])+'</div><div class="topic-fill-bg"><div class="topic-fill" style="width:'+pct+'%"></div></div><div class="topic-count">'+t[1]+'</div></div>';
+    });
+
+    var corrDiv=document.getElementById('correctionsList');
+    corrDiv.innerHTML='';
+    var corrs=d.corrections||[];
+    corrs.slice(-10).reverse().forEach(function(c){
+      corrDiv.innerHTML+='<div class="correction-item"><div class="orig">'+escapeHtml(c.original||'')+'</div><div class="corr">-> '+escapeHtml(c.corrected||'')+'</div><div class="corr-time">'+escapeHtml(c.timestamp||'')+'</div></div>';
+    });
+    if(corrs.length===0)corrDiv.innerHTML='<div style="color:var(--txdd);font-size:13px">Aucune correction enregistree.</div>';
+
+    var sumDiv=document.getElementById('summariesList');
+    sumDiv.innerHTML='';
+    var sums=d.conversation_summaries||[];
+    sums.slice(-5).reverse().forEach(function(s){
+      var topicList=Object.entries(s.topics||{}).sort(function(a,b){return b[1]-a[1]}).slice(0,5).map(function(t){return t[0]+' ('+t[1]+')'}).join(', ');
+      sumDiv.innerHTML+='<div class="correction-item"><div class="corr">'+escapeHtml(s.period||'')+'</div><div style="font-size:11px;color:var(--txd);margin-top:4px">'+s.count+' conversations | Sujets: '+escapeHtml(topicList)+'</div></div>';
+    });
+    if(sums.length===0)sumDiv.innerHTML='<div style="color:var(--txdd);font-size:13px">Pas encore de resumes.</div>';
+  });
+}
+
+function updateUptime(){
+  var upMs=Date.now()-startTime;
+  var mins=Math.floor(upMs/60000);
+  var el=document.getElementById('dUptime');
+  if(el){
+    if(mins>60)el.textContent=Math.floor(mins/60)+'h'+(mins%60)+'m';
+    else el.textContent=mins+'m';
+  }
+}
+setInterval(updateUptime,60000);
+
+function checkMobile(){
+  var btn=document.getElementById('menuToggle');
+  if(window.innerWidth<=768){btn.style.display='flex';}
+  else{btn.style.display='none';document.getElementById('sidebar').classList.remove('open');}
+}
+window.addEventListener('resize',checkMobile);
+checkMobile();
+
+// --- PWA ---
+var deferredPrompt=null;
+window.addEventListener('beforeinstallprompt',function(e){
+  e.preventDefault();deferredPrompt=e;
+  document.getElementById('installBtn').style.display='inline-flex';
+});
+function installPWA(){
+  if(!deferredPrompt)return;
+  deferredPrompt.prompt();
+  deferredPrompt.userChoice.then(function(choice){
+    if(choice.outcome==='accepted')document.getElementById('installBtn').style.display='none';
+    deferredPrompt=null;
+  });
+}
+if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){});}
+</script>
+</body>
+</html>"""
+
+RENDERED_HTML = HTML_TEMPLATE.encode("utf-8")
 
 
+# =====================================================================
+#  PWA ROUTES
+# =====================================================================
+@app.route("/manifest.json")
+def pwa_manifest():
+    manifest = {
+        "name": "ELLIOTT - IA Ultime",
+        "short_name": "ELLIOTT",
+        "description": "Assistant IA ultime: Chat, Images, Musique, Vision, Code",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#06060a",
+        "theme_color": "#6366f1",
+        "orientation": "any",
+        "icons": [
+            {"src": "/icon/192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/icon/512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+        ],
+    }
+    body = _json.dumps(manifest, ensure_ascii=False).encode("utf-8")
+    return Response(body, content_type="application/json; charset=utf-8")
+
+
+@app.route("/sw.js")
+def service_worker():
+    sw_code = """
+const CACHE_NAME='elliott-v1';
+const urlsToCache=['/'];
+self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE_NAME).then(c=>c.addAll(urlsToCache)).then(()=>self.skipWaiting()));});
+self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(k=>Promise.all(k.filter(k=>k!==CACHE_NAME).map(k=>caches.delete(k)))).then(()=>self.clients.claim()));});
+self.addEventListener('fetch',e=>{if(e.request.method!=='GET')return;e.respondWith(caches.match(e.request).then(r=>{return r||fetch(e.request).then(resp=>{if(!resp||resp.status!==200)return resp;const r2=resp.clone();caches.open(CACHE_NAME).then(c=>c.put(e.request,r2));return resp;}).catch(()=>caches.match('/')));}));});
+"""
+    return Response(sw_code, content_type="application/javascript")
+
+
+@app.route("/icon/<int:size>.png")
+def pwa_icon(size):
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        cached = os.path.join(GENERATED_DIR, f"icon-{size}.png")
+        if os.path.exists(cached):
+            return send_file(cached, mimetype="image/png")
+        img = Image.new("RGB", (size, size), (99, 102, 241))
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("arial.ttf", size // 2)
+        except Exception:
+            font = ImageFont.load_default()
+        bbox = draw.textbbox((0, 0), "E", font=font)
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+        draw.text(((size - w) // 2, (size - h) // 2 - bbox[1]), "E", fill="white", font=font)
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        with open(cached, "wb") as f:
+            f.write(buf.getvalue())
+        buf.seek(0)
+        return send_file(buf, mimetype="image/png")
+    except Exception:
+        img = Image.new("RGB", (size, size), (99, 102, 241))
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        return send_file(buf, mimetype="image/png")
+
+
+# =====================================================================
+#  STATIC FILES (generated)
+# =====================================================================
+@app.route("/generated/<path:filename>")
+def serve_generated(filename):
+    return send_from_directory(GENERATED_DIR, filename)
+
+
+# =====================================================================
+#  API ROUTES
+# =====================================================================
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return Response(RENDERED_HTML, content_type="text/html; charset=utf-8")
 
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
-    data = request.json
+    data = request.get_json(silent=True)
     if not data:
-        return jsonify({"error": "Donnees invalides"}), 400
-    
+        return Response(b'{"error":"Invalid"}', status=400, content_type="application/json")
     message = data.get("message", "").strip()
     if not message:
-        return jsonify({"error": "Message vide"}), 400
-    
-    # Recherche dans le cache
-    cache_key = message.lower()
-    if cache_key in response_cache:
-        return jsonify(response_cache[cache_key])
-    
-    # Reponse instantanee
-    response = get_instant_response(message.lower())
-    
-    # Mise en cache
-    response_cache[cache_key] = response
-    
-    return jsonify(response)
+        return Response(b'{"error":"Empty"}', status=400, content_type="application/json")
+    conv_id = data.get("conversation_id", "default")
 
+    if conv_id not in conversations:
+        conversations[conv_id] = []
+    if len(conversations[conv_id]) > 20:
+        conversations[conv_id] = conversations[conv_id][-10:]
 
-def get_instant_response(message_lower):
-    """Reponse instantanee avec prechargement"""
-    
-    # Recherche exacte
-    if message_lower in FAST_RESPONSES:
-        return FAST_RESPONSES[message_lower]
-    
-    # Recherche partielle dans les cles
-    for key in FAST_RESPONSES:
-        if key in message_lower or message_lower in key:
-            return FAST_RESPONSES[key]
-    
-    # Recherche dans KNOWLEDGE
-    for topic, content in KNOWLEDGE.items():
-        if topic in message_lower:
-            return {
-                "text": content,
-                "suggestions": [t for t in KNOWLEDGE.keys() if t != topic][:4]
-            }
-    
-    # Recherche partielle dans KNOWLEDGE
-    for topic, content in KNOWLEDGE.items():
-        if any(word in message_lower for word in topic.split()):
-            return {
-                "text": content,
-                "suggestions": [t for t in KNOWLEDGE.keys() if t != topic][:4]
-            }
-    
-    # Reponse par defaut
-    return FAST_RESPONSES["defaut"]
+    m = get_memory()
+    msg_lower = message.lower()
 
+    m["stats"]["total_messages"] += 1
+    save_memory(m)
 
-@app.route("/api/suggestions", methods=["GET"])
-def get_suggestions():
-    return jsonify({"code": ["Python", "JavaScript", "HTML/CSS"], "apprendre": ["Python", "Machine Learning", "Git"], "creer": ["Portfolio", "Blog", "Chatbot"]})
-
-
-@app.route("/api/knowledge", methods=["GET"])
-def get_knowledge():
-    return jsonify(KNOWLEDGE)
-
-
-@app.errorhandler(404)
-def not_found(e):
-    return jsonify({"error": "Non trouve"}), 404
-
-
-@app.errorhandler(500)
-def server_error(e):
-    return jsonify({"error": "Erreur serveur"}), 500
-
-
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ELLIOTT - Assistant Instantane</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Segoe UI', sans-serif; background: #0a0a12; min-height: 100vh; color: #f1f5f9; }
-        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-        .header { display: flex; align-items: center; justify-content: space-between; padding: 20px 0; border-bottom: 3px solid #ea580c; margin-bottom: 30px; }
-        .logo-section { display: flex; align-items: center; gap: 20px; }
-        .logo { width: 80px; height: 80px; background: linear-gradient(135deg, #ea580c, #fb923c); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 36px; box-shadow: 0 0 30px rgba(234,88,12,0.5); }
-        .title { font-size: 32px; font-weight: 700; color: #ea580c; }
-        .subtitle { font-size: 14px; color: #94a3b8; }
-        .status { display: flex; align-items: center; gap: 8px; color: #22c55e; }
-        .status-dot { width: 12px; height: 12px; background: #22c55e; border-radius: 50%; animation: pulse 2s infinite; }
-        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
-        .main { display: grid; grid-template-columns: 1fr 350px; gap: 20px; height: calc(100vh - 200px); }
-        .chat-section { background: #1e293b; border-radius: 16px; overflow: hidden; display: flex; flex-direction: column; }
-        .chat-header { padding: 20px; background: #0f172a; border-bottom: 1px solid #334155; }
-        .chat-messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
-        .message { display: flex; gap: 12px; max-width: 80%; animation: fadeIn 0.1s ease; }
-        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-        .message.user { align-self: flex-end; flex-direction: row-reverse; }
-        .message-avatar { width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; }
-        .message.user .message-avatar { background: #3b82f6; }
-        .message.assistant .message-avatar { background: linear-gradient(135deg, #ea580c, #fb923c); }
-        .message-content { background: #0f172a; padding: 16px; border-radius: 12px; line-height: 1.6; }
-        .message.user .message-content { background: #3b82f6; }
-        .suggestions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-        .suggestion-btn { background: #334155; border: none; padding: 8px 16px; border-radius: 20px; color: #f1f5f9; cursor: pointer; font-size: 13px; transition: all 0.1s; }
-        .suggestion-btn:hover { background: #ea580c; transform: translateY(-2px); }
-        .input-section { padding: 20px; background: #0f172a; border-top: 1px solid #334155; }
-        .input-container { display: flex; gap: 12px; }
-        .chat-input { flex: 1; background: #1e293b; border: 2px solid #334155; border-radius: 12px; padding: 16px; color: #f1f5f9; font-size: 16px; transition: border-color 0.1s; }
-        .chat-input:focus { outline: none; border-color: #ea580c; }
-        .send-btn { background: linear-gradient(135deg, #ea580c, #fb923c); border: none; padding: 16px 32px; border-radius: 12px; color: white; font-weight: 600; cursor: pointer; transition: transform 0.1s; }
-        .send-btn:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(234,88,12,0.4); }
-        .sidebar { display: flex; flex-direction: column; gap: 20px; }
-        .card { background: #1e293b; border-radius: 16px; padding: 20px; }
-        .card-title { font-size: 18px; font-weight: 600; margin-bottom: 16px; color: #ea580c; }
-        .quick-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-        .action-btn { background: linear-gradient(135deg, #334155, #1e293b); border: none; padding: 16px; border-radius: 12px; color: #f1f5f9; cursor: pointer; transition: all 0.1s; text-align: center; }
-        .action-btn:hover { background: linear-gradient(135deg, #ea580c, #fb923c); transform: translateY(-3px); }
-        .action-btn .icon { font-size: 24px; margin-bottom: 8px; }
-        .action-btn .text { font-size: 12px; }
-        .topic-list { display: flex; flex-direction: column; gap: 8px; }
-        .topic-item { background: #0f172a; padding: 12px 16px; border-radius: 8px; cursor: pointer; transition: all 0.1s; border-left: 3px solid transparent; }
-        .topic-item:hover { border-left-color: #ea580c; transform: translateX(5px); }
-        .dragon-container { text-align: center; padding: 20px; }
-        .dragon { font-size: 80px; animation: float 3s ease-in-out infinite; }
-        @keyframes float { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-10px); } }
-        @media (max-width: 900px) { .main { grid-template-columns: 1fr; height: auto; } .sidebar { order: -1; } }
-        ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: #1e293b; }
-        ::-webkit-scrollbar-thumb { background: #ea580c; border-radius: 4px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <div class="logo-section">
-                <div class="logo">D</div>
-                <div>
-                    <div class="title">ELLIOTT</div>
-                    <div class="subtitle">Assistant Instantane</div>
-                </div>
-            </div>
-            <div class="status">
-                <div class="status-dot"></div>
-                <span>En ligne</span>
-            </div>
-        </div>
-        <div class="main">
-            <div class="chat-section">
-                <div class="chat-header"><h2>Conversation</h2></div>
-                <div class="chat-messages" id="chatMessages">
-                    <div class="message assistant">
-                        <div class="message-avatar">D</div>
-                        <div class="message-content">
-                            Bonjour! Je suis <strong>ELLIOTT</strong>. Posez votre question, la reponse est instantanee!
-                            <div class="suggestions">
-                                <button class="suggestion-btn" onclick="sendSuggestion('Python')">Python</button>
-                                <button class="suggestion-btn" onclick="sendSuggestion('JavaScript')">JavaScript</button>
-                                <button class="suggestion-btn" onclick="sendSuggestion('IA')">IA</button>
-                                <button class="suggestion-btn" onclick="sendSuggestion('Aide')">Aide</button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                <div class="input-section">
-                    <div class="input-container">
-                        <input type="text" class="chat-input" id="chatInput" placeholder="Posez votre question..." maxlength="500" onkeypress="if(event.key==='Enter')sendMessage()">
-                        <button class="send-btn" id="sendBtn" onclick="sendMessage()">ENVOYER</button>
-                    </div>
-                </div>
-            </div>
-            <div class="sidebar">
-                <div class="card dragon-container">
-                    <div class="dragon">D</div>
-                    <p style="margin-top: 10px; color: #94a3b8;">Reponses instantanees</p>
-                </div>
-                <div class="card">
-                    <div class="card-title">Actions Rapides</div>
-                    <div class="quick-actions">
-                        <button class="action-btn" onclick="sendSuggestion('Python')"><div class="icon">P</div><div class="text">Python</div></button>
-                        <button class="action-btn" onclick="sendSuggestion('JavaScript')"><div class="icon">JS</div><div class="text">JavaScript</div></button>
-                        <button class="action-btn" onclick="sendSuggestion('HTML')"><div class="icon">W</div><div class="text">HTML/CSS</div></button>
-                        <button class="action-btn" onclick="sendSuggestion('IA')"><div class="icon">IA</div><div class="text">IA/ML</div></button>
-                        <button class="action-btn" onclick="sendSuggestion('Git')"><div class="icon">G</div><div class="text">Git</div></button>
-                        <button class="action-btn" onclick="sendSuggestion('API')"><div class="icon">A</div><div class="text">API</div></button>
-                    </div>
-                </div>
-                <div class="card">
-                    <div class="card-title">Sujets Populaires</div>
-                    <div class="topic-list">
-                        <div class="topic-item" onclick="sendSuggestion('Python')">Python</div>
-                        <div class="topic-item" onclick="sendSuggestion('JavaScript')">JavaScript</div>
-                        <div class="topic-item" onclick="sendSuggestion('Machine Learning')">Machine Learning</div>
-                        <div class="topic-item" onclick="sendSuggestion('React')">React</div>
-                        <div class="topic-item" onclick="sendSuggestion('API REST')">API REST</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-    <script>
-        let conversationId = localStorage.getItem('elliott_conv') || ('c_' + Date.now());
-        localStorage.setItem('elliott_conv', conversationId);
-        
-        function escapeHtml(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
-        
-        function addMessage(content, isUser, suggestions) {
-            const m = document.getElementById('chatMessages');
-            const div = document.createElement('div');
-            div.className = 'message ' + (isUser ? 'user' : 'assistant');
-            const avatar = isUser ? 'V' : 'D';
-            const safe = isUser ? escapeHtml(content) : content.replace(/\\n/g, '<br>');
-            let sug = '';
-            if (suggestions && suggestions.length > 0 && !isUser) {
-                sug = '<div class="suggestions">' + suggestions.map(s => '<button class="suggestion-btn" onclick="sendSuggestion(\\'' + escapeHtml(s).replace(/'/g, "\\'") + '\\')">' + escapeHtml(s) + '</button>').join('') + '</div>';
-            }
-            div.innerHTML = '<div class="message-avatar">' + avatar + '</div><div class="message-content">' + safe + sug + '</div>';
-            m.appendChild(div);
-            m.scrollTop = m.scrollHeight;
+    # Correction detection
+    if is_correction(message) and m["corrections"]:
+        last_corr = m["corrections"][-1]
+        corrected_text = message
+        update_memory(lambda mem: record_correction(mem, last_corr.get("original", ""), corrected_text, conv_id))
+        resp = {
+            "text": "Merci pour la correction! J'ai retenu: **" + corrected_text + "**. Je m'en souviendrai!",
+            "speak": "Merci pour la correction.",
+            "confidence": 1.0,
+            "fromAI": True,
         }
-        
-        function sendSuggestion(t) { document.getElementById('chatInput').value = t; sendMessage(); }
-        
-        async function sendMessage() {
-            const input = document.getElementById('chatInput');
-            const msg = input.value.trim();
-            if (!msg) return;
-            addMessage(msg, true);
-            input.value = '';
-            try {
-                const r = await fetch('/api/chat', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({message: msg, conversation_id: conversationId}) });
-                const d = await r.json();
-                addMessage(d.text || 'Pas de reponse', false, d.suggestions || []);
-            } catch(e) { addMessage("Erreur. Reessayez.", false); }
-            input.focus();
-        }
-    </script>
-</body>
-</html>
-"""
+        body = _json.dumps(resp, ensure_ascii=False).encode("utf-8")
+        return Response(body, content_type="application/json; charset=utf-8")
 
+    # Fast responses
+    fast = get_fast_response(msg_lower)
+    if fast is not None:
+        conversations[conv_id].append({"role": "user", "content": message})
+        conversations[conv_id].append({"role": "assistant", "content": fast["text"]})
+        resp = dict(fast)
+        resp["fromAI"] = False
+        resp["confidence"] = 1.0
+        body = _json.dumps(resp, ensure_ascii=False).encode("utf-8")
+        return Response(body, content_type="application/json; charset=utf-8")
+
+    # Image request
+    if is_image_request(message):
+        clean_prompt = extract_image_prompt(message)
+        if len(clean_prompt) < 3:
+            clean_prompt = message
+        url = generate_image(clean_prompt)
+        if url:
+            update_memory(lambda mem: mem["stats"].__setitem__("images_generated", mem["stats"].get("images_generated", 0) + 1))
+            resp = {
+                "text": "Voici votre image:",
+                "image_url": url,
+                "image_prompt": clean_prompt,
+                "fromAI": True,
+                "confidence": 1.0,
+            }
+        else:
+            resp = {"text": "Image non disponible. Verifiez votre connexion.", "fromAI": True, "confidence": 0.5}
+        body = _json.dumps(resp, ensure_ascii=False).encode("utf-8")
+        return Response(body, content_type="application/json; charset=utf-8")
+
+    # Music request
+    if is_music_request(message):
+        music_prompt = extract_music_prompt(message)
+        result_path = generate_music(music_prompt)
+        if result_path:
+            filename = os.path.basename(result_path)
+            update_memory(lambda mem: mem["stats"].__setitem__("music_generated", mem["stats"].get("music_generated", 0) + 1))
+            resp = {
+                "text": f"🎵 Musique generee pour: {music_prompt}",
+                "music_url": f"/generated/{filename}",
+                "music_prompt": music_prompt,
+                "fromAI": True,
+                "confidence": 1.0,
+            }
+        else:
+            resp = {
+                "text": "Generation musicale non disponible. Essayez de reformuler votre demande.",
+                "fromAI": True,
+                "confidence": 0.3,
+            }
+        body = _json.dumps(resp, ensure_ascii=False).encode("utf-8")
+        return Response(body, content_type="application/json; charset=utf-8")
+
+    # Track topics
+    topics = extract_topics(message)
+    update_memory(lambda mem: track_topics(mem, topics))
+    for t in topics:
+        if t != "general":
+            update_memory(lambda mem, topic=t, msg=message: record_knowledge(mem, topic, msg))
+
+    # Web search if needed
+    web_context = ""
+    search_used = False
+    if needs_web_search(message):
+        results = web_search(message)
+        if results:
+            web_context = "\n\nIMPORTANT: Voici les resultats de recherche web. Utilise-les pour repondre:\n"
+            for i, r in enumerate(results, 1):
+                web_context += f"{i}. {r['title']}: {r['snippet']}\n"
+            search_used = True
+            update_memory(lambda mem: mem["stats"].__setitem__("searches_performed", mem["stats"].get("searches_performed", 0) + 1))
+
+    # Get memory context
+    memory_context = find_relevant_memory(m, message)
+
+    # Get AI response
+    conversations[conv_id].append({"role": "user", "content": message})
+    ai_response = chat_ia(message, conversations[conv_id], memory_context, web_context)
+    conversations[conv_id].append({"role": "assistant", "content": ai_response})
+
+    # Calculate confidence & quality
+    confidence = calculate_confidence(ai_response)
+    quality = calculate_quality(ai_response, topics)
+
+    # Record conversation in memory
+    update_memory(lambda mem: mem["conversations"].append({
+        "question": message[:200],
+        "answer": ai_response[:200],
+        "topics": topics,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "conversation_id": conv_id,
+        "quality": quality,
+    }))
+    update_memory(lambda mem: mem["stats"].__setitem__("total_conversations", len(mem["conversations"])))
+
+    # Update quality average
+    all_quality = [c.get("quality", 0.5) for c in m.get("conversations", [])[-20:]]
+    avg_quality = sum(all_quality) / len(all_quality) if all_quality else 0.5
+    update_memory(lambda mem, q=avg_quality: mem["stats"].__setitem__("quality_score_avg", q))
+
+    # Update favorite topics
+    update_memory(lambda mem: mem["preferences"].__setitem__(
+        "favorite_topics",
+        sorted(mem["topics"].keys(), key=lambda k: mem["topics"][k], reverse=True)[:10],
+    ))
+
+    # Summarize old conversations periodically
+    m_updated = load_memory()
+    summarize_old_conversations(m_updated)
+    save_memory(m_updated)
+
+    resp = {
+        "text": ai_response,
+        "speak": ai_response,
+        "confidence": confidence,
+        "fromAI": True,
+        "search_used": search_used,
+    }
+    body = _json.dumps(resp, ensure_ascii=False).encode("utf-8")
+    return Response(body, content_type="application/json; charset=utf-8")
+
+
+@app.route("/api/image", methods=["POST"])
+def api_image():
+    data = request.get_json(silent=True)
+    if not data:
+        return Response(b'{"error":"Invalid"}', status=400, content_type="application/json")
+    prompt = data.get("prompt", "").strip()
+    if not prompt:
+        return Response(b'{"error":"Empty"}', status=400, content_type="application/json")
+    url = generate_image(prompt)
+    if url:
+        update_memory(lambda mem: mem["stats"].__setitem__("images_generated", mem["stats"].get("images_generated", 0) + 1))
+        resp = {"url": url, "prompt": prompt}
+    else:
+        resp = {"error": "Image non disponible"}
+    body = _json.dumps(resp, ensure_ascii=False).encode("utf-8")
+    return Response(body, content_type="application/json; charset=utf-8")
+
+
+@app.route("/api/music", methods=["POST"])
+def api_music():
+    data = request.get_json(silent=True)
+    if not data:
+        return Response(b'{"error":"Invalid"}', status=400, content_type="application/json")
+    prompt = data.get("prompt", "").strip()
+    if not prompt:
+        return Response(b'{"error":"Empty"}', status=400, content_type="application/json")
+    result_path = generate_music(prompt)
+    if result_path:
+        filename = os.path.basename(result_path)
+        update_memory(lambda mem: mem["stats"].__setitem__("music_generated", mem["stats"].get("music_generated", 0) + 1))
+        resp = {"url": f"/generated/{filename}", "prompt": prompt}
+    else:
+        resp = {"error": "Generation musicale echouee"}
+    body = _json.dumps(resp, ensure_ascii=False).encode("utf-8")
+    return Response(body, content_type="application/json; charset=utf-8")
+
+
+@app.route("/api/execute", methods=["POST"])
+def api_execute():
+    data = request.get_json(silent=True)
+    if not data:
+        return Response(b'{"error":"Invalid"}', status=400, content_type="application/json")
+    code = data.get("code", "").strip()
+    if not code:
+        return Response(b'{"error":"Empty"}', status=400, content_type="application/json")
+    timeout = min(data.get("timeout", 10), 30)
+    result = execute_python_code(code, timeout)
+    update_memory(lambda mem: mem["stats"].__setitem__("code_executed", mem["stats"].get("code_executed", 0) + 1))
+    body = _json.dumps(result, ensure_ascii=False).encode("utf-8")
+    return Response(body, content_type="application/json; charset=utf-8")
+
+
+@app.route("/api/vision", methods=["POST"])
+def api_vision():
+    data = request.get_json(silent=True)
+    if not data:
+        return Response(b'{"error":"Invalid"}', status=400, content_type="application/json")
+    url = data.get("url", "")
+    b64 = data.get("base64", "")
+    if url:
+        result = analyze_image_url(url)
+    elif b64:
+        result = analyze_image_b64(b64)
+    else:
+        return Response(b'{"error":"No image"}', status=400, content_type="application/json")
+    update_memory(lambda mem: mem["stats"].__setitem__("images_analyzed", mem["stats"].get("images_analyzed", 0) + 1))
+    resp = {"description": result}
+    body = _json.dumps(resp, ensure_ascii=False).encode("utf-8")
+    return Response(body, content_type="application/json; charset=utf-8")
+
+
+@app.route("/api/search", methods=["POST"])
+def api_search():
+    data = request.get_json(silent=True)
+    if not data:
+        return Response(b'{"error":"Invalid"}', status=400, content_type="application/json")
+    query = data.get("query", "").strip()
+    if not query:
+        return Response(b'{"error":"Empty"}', status=400, content_type="application/json")
+    results = web_search(query, num_results=8)
+    update_memory(lambda mem: mem["stats"].__setitem__("searches_performed", mem["stats"].get("searches_performed", 0) + 1))
+    resp = {"results": results or [], "query": query}
+    body = _json.dumps(resp, ensure_ascii=False).encode("utf-8")
+    return Response(body, content_type="application/json; charset=utf-8")
+
+
+@app.route("/api/feedback", methods=["POST"])
+def api_feedback():
+    data = request.get_json(silent=True)
+    if not data:
+        return Response(b'{"error":"Invalid"}', status=400, content_type="application/json")
+    positive = data.get("positive", True)
+    conv_id = data.get("conversation_id", "default")
+
+    def update(m):
+        if positive:
+            m["stats"]["thumbs_up"] = m["stats"].get("thumbs_up", 0) + 1
+        else:
+            m["stats"]["thumbs_down"] = m["stats"].get("thumbs_down", 0) + 1
+        m["feedback"].append({
+            "positive": positive,
+            "conversation_id": conv_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+    update_memory(update)
+    return Response(b'{"ok":true}', content_type="application/json")
+
+
+@app.route("/api/memory", methods=["GET"])
+def api_memory():
+    m = get_memory()
+    body = _json.dumps(m, ensure_ascii=False).encode("utf-8")
+    return Response(body, content_type="application/json; charset=utf-8")
+
+
+# =====================================================================
+#  MAIN
+# =====================================================================
 if __name__ == "__main__":
-    print("=" * 50)
-    print("  ELLIOTT - Assistant Instantane")
+    generate_pwa_icons()
+    print("=" * 60)
+    print("  ELLIOTT - IA Ultime (Version Ultime)")
     print("  http://localhost:5000")
-    print("=" * 50)
-    app.run(debug=False, host="127.0.0.1", port=5000)
+    print("  Chat: KiloCode + Pollinations")
+    print("  Images: Pollinations")
+    print("  Musique: MusicGen (HuggingFace)")
+    print("  Vision: IA Multimodale")
+    print("  Code: Python Sandbox")
+    print("  Recherche: DuckDuckGo")
+    print("  Memoire: " + MEMORY_FILE)
+    print("  PWA: Installable sur mobile")
+    print("  100% GRATUIT!")
+    print("=" * 60)
+    app.run(debug=False, host="127.0.0.1", port=5000, threaded=True)
