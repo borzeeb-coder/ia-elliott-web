@@ -38,35 +38,110 @@ CHAT_API_KILOCODE = "https://api.kilo.ai/api/gateway/v1/chat/completions"
 CHAT_MODELS = [
     "kilo-auto/free",
     "nex-agi/nex-n2.5-pro:free",
-    "nvidia/nemotron-3-ultra-550b-a55b:free",
 ]
-CHAT_API_POLLINATIONS = "https://text.pollinations.ai/"
 
 # =====================================================================
-#  WEB SEARCH
+#  WEB SEARCH (Bing + GoogleNews RSS + Wikipedia)
 # =====================================================================
-def web_search(query, num_results=5):
+
+def _bing_search(query, num_results=5):
     try:
-        try:
-            from ddgs import DDGS
-        except ImportError:
-            from duckduckgo_search import DDGS
-        results = DDGS().text(query, max_results=num_results)
-        return [
-            {"title": r.get("title", ""), "snippet": r.get("body", ""), "url": r.get("href", "")}
-            for r in results
-        ]
+        from bs4 import BeautifulSoup
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+        r = _requests.get(
+            f"https://www.bing.com/search?q={quote(query)}&setlang=fr&cc=FR&mkt=fr-FR",
+            headers=headers,
+            timeout=10,
+        )
+        soup = BeautifulSoup(r.content, "html.parser")
+        results = []
+        for li in soup.select("li.b_algo"):
+            title_el = li.select_one("h2 a")
+            snippet_el = li.select_one(".b_caption p, .b_algoSlug")
+            if title_el:
+                title_text = title_el.get_text(strip=True)
+                if len(title_text) > 3:
+                    results.append({
+                        "title": title_text,
+                        "snippet": snippet_el.get_text(strip=True) if snippet_el else "",
+                        "url": title_el.get("href", ""),
+                    })
+        return results[:num_results]
     except Exception as e:
-        print(f"Search error: {e}")
-        return None
+        print(f"Bing error: {e}")
+        return []
+
+
+def _google_news_search(query, num_results=5):
+    try:
+        from bs4 import BeautifulSoup
+        r = _requests.get(
+            "https://news.google.com/rss/search",
+            params={"q": query, "hl": "fr", "gl": "FR", "ceid": "FR:fr"},
+            timeout=10,
+        )
+        soup = BeautifulSoup(r.content, "xml")
+        results = []
+        for item in soup.find_all("item"):
+            title = item.find("title").text if item.find("title") else ""
+            source = item.find("source").text if item.find("source") else ""
+            link = item.find("link").text if item.find("link") else ""
+            results.append({"title": title, "snippet": source, "url": link})
+        return results[:num_results]
+    except Exception as e:
+        print(f"GoogleNews error: {e}")
+        return []
+
+
+def _wikipedia_summary(query):
+    try:
+        headers = {"User-Agent": "ELLIOTT/1.0 (assistant-ia; contact@elliott.ai)"}
+        search_url = f"https://fr.wikipedia.org/w/api.php"
+        params = {
+            "action": "query", "list": "search", "srsearch": query,
+            "format": "json", "srlimit": 1,
+        }
+        r = _requests.get(search_url, params=params, headers=headers, timeout=8)
+        data = r.json()
+        results = data.get("query", {}).get("search", [])
+        if results:
+            title = results[0]["title"].replace(" ", "_")
+            r2 = _requests.get(
+                f"https://fr.wikipedia.org/api/rest_v1/page/summary/{title}",
+                headers=headers,
+                timeout=8,
+            )
+            if r2.status_code == 200:
+                d = r2.json()
+                return {"title": d.get("title", ""), "snippet": d.get("extract", "")[:300], "url": d.get("content_urls", {}).get("desktop", {}).get("page", "")}
+    except Exception as e:
+        print(f"Wikipedia error: {e}")
+    return None
+
+
+def web_search(query, num_results=5):
+    results = _google_news_search(query, num_results)
+    if not results:
+        results = _bing_search(query, num_results)
+    wiki = _wikipedia_summary(query)
+    if wiki and not any(wiki["title"].lower() in r["title"].lower() for r in results):
+        results.insert(0, wiki)
+    return results
 
 
 def needs_web_search(message):
     search_keywords = [
         "actualit", "nouveau", "recent", "prix", "cours",
-        "meteo", "aujourd'hui", "2024", "2025", "2026",
+        "meteo", "aujourd'hui", "2024", "2025", "2026", "2027",
         "dernier", "derniere", "meilleur", "compar",
         "championnat", "election", "bourse", "cotation",
+        "qu'est-ce qui", "que se passe", "info", "nouvelle",
+        "derniere actu", "monde", "france", "international",
+        "sport", "football", " rugby", "tennis",
     ]
     msg_lower = message.lower()
     return any(kw in msg_lower for kw in search_keywords)
@@ -513,7 +588,8 @@ def chat_ia(message, history, memory_context="", web_context=""):
         "sciences, art, musique, creation, artisanat, cuisine, et bien plus. "
         "Tu peux: coder, expliquer, creer, ecrire, traduire, analyser, conseiller. "
         "Tu es creatif, precis et amical. Tu reponds en markdown avec du code formate. "
-        "Tu t'adaptes au style de l'utilisateur."
+        "Tu t'adaptes au style de l'utilisateur. "
+        "Quand tu recois des resultats de recherche web, integre-les dans ta reponse de facon naturelle et utile."
     )
     if memory_context:
         system += f"\n\nContexte memoire (souviens-toi de ceci pour repondre mieux):\n{memory_context}"
@@ -540,17 +616,6 @@ def chat_ia(message, history, memory_context="", web_context=""):
                         return content
         except Exception as e:
             print(f"KiloCode error ({model}): {e}")
-
-    try:
-        r = _requests.post(
-            CHAT_API_POLLINATIONS,
-            json={"messages": messages, "model": "openai"},
-            timeout=60,
-        )
-        if r.status_code == 200 and len(r.text) > 10:
-            return r.text.strip()
-    except Exception as e:
-        print(f"Pollinations error: {e}")
 
     return "Je suis temporairement indisponible. Verifiez votre connexion internet."
 
@@ -620,13 +685,16 @@ def get_fast_response(message):
     resp = FAST_RESPONSES.get(message)
     if resp is not None:
         return resp
-    for key in FAST_KEYS:
-        if key in message:
-            return FAST_RESPONSES[key]
-    for word in message.split():
-        candidates = _WORD_INDEX.get(word)
-        if candidates:
-            return FAST_RESPONSES[max(candidates, key=len)]
+    words = message.split()
+    if len(words) <= 3:
+        for key in FAST_KEYS:
+            if key in message:
+                return FAST_RESPONSES[key]
+    for word in words:
+        if len(words) <= 3:
+            candidates = _WORD_INDEX.get(word)
+            if candidates:
+                return FAST_RESPONSES[max(candidates, key=len)]
     return None
 
 
@@ -919,6 +987,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <link rel="apple-touch-icon" href="/icon/192.png">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
+body{padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
 :root{
   --bg:#06060a;--bgc:#0f0f15;--bgh:#1a1a24;--bd:#1e1e2e;
   --tx:#e8e8f0;--txd:#6b6b80;--txdd:#4a4a5e;
@@ -1152,16 +1221,72 @@ textarea.tool-input{min-height:200px;resize:vertical;font-family:"Fira Code",Con
 .doc-upload-btn input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer}
 
 @media(max-width:768px){
-  .sidebar{transform:translateX(-100%)}
+  .sidebar{transform:translateX(-100%);z-index:999;width:80vw;position:fixed;top:0;left:0;height:100vh}
   .sidebar.open{transform:translateX(0)}
-  .main{margin-left:0}
-  .message{max-width:95%}
+  .sidebar-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);z-index:998}
+  .sidebar-overlay.active{display:block}
+  .main{margin-left:0;width:100vw;overflow-x:hidden}
+  .header{padding:10px 12px;position:sticky;top:0;z-index:50}
+  .header-title{font-size:14px}
+  .header-subtitle{font-size:10px}
+  .header-btn{width:32px;height:32px}
+  .header-btn svg{width:14px;height:14px}
+  #menuToggle{display:flex!important}
+  .install-btn{font-size:11px;padding:4px 10px}
+  .chat{padding:12px 10px;gap:10px}
+  .message{max-width:92%;gap:6px}
+  .message-content{padding:10px 12px;font-size:13px;line-height:1.5;border-radius:14px}
+  .message-avatar{width:28px;height:28px;border-radius:8px}
+  .msg-action-btn{width:26px;height:26px}
+  .msg-action-btn svg{width:11px;height:11px}
+  .input-container{padding:8px 10px 16px}
+  .input-wrapper{padding:4px;gap:4px;border-radius:16px;flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .chat-input{padding:8px 10px;font-size:16px;min-width:0}
+  .action-btn{width:36px;height:36px;flex-shrink:0}
+  .action-btn svg{width:16px;height:16px}
+  .voice-btn{display:flex}
+  .welcome{padding:30px 16px}
+  .welcome-icon{width:60px;height:60px;border-radius:16px}
+  .welcome-icon svg{width:30px;height:30px}
+  .welcome h2{font-size:18px}
+  .welcome p{font-size:13px;margin-bottom:16px}
+  .welcome-grid{grid-template-columns:1fr 1fr;gap:8px}
+  .welcome-card{padding:12px 10px}
+  .welcome-card-icon{width:32px;height:32px;border-radius:8px}
+  .welcome-card-icon svg{width:14px;height:14px}
+  .welcome-card h4{font-size:12px}
+  .welcome-card p{font-size:10px}
+  .dash-grid{grid-template-columns:repeat(2,1fr);gap:8px}
+  .dash-card{padding:14px 8px}
+  .dash-num{font-size:22px}
+  .dash-label{font-size:10px}
+  .dash-section{padding:14px}
+  .tool-panel{padding:0 4px}
+  .tool-panel h2{font-size:16px}
+  .tool-input{padding:10px 12px;font-size:14px}
+  textarea.tool-input{min-height:150px}
+  .tool-btn{padding:8px 14px;font-size:13px}
+  .tool-btn svg{width:14px;height:14px}
+  .tool-result{padding:12px;font-size:12px;max-height:300px}
+  .suggestions{gap:4px}
+  .suggestion{padding:5px 10px;font-size:11px}
+  .music-player{padding:10px}
+  .voice-circle{width:150px;height:150px}
+  .voice-icon{width:50px;height:50px}
+  .voice-status{font-size:16px}
+  .voice-header{padding:12px 16px}
+  .voice-close{width:36px;height:36px;font-size:20px}
+}
+@media(max-width:380px){
   .welcome-grid{grid-template-columns:1fr}
-  .dash-grid{grid-template-columns:repeat(2,1fr)}
+  .dash-grid{grid-template-columns:1fr 1fr}
+  .input-wrapper{flex-wrap:wrap}
+  .action-btn{width:34px;height:34px}
 }
 </style>
 </head>
 <body>
+<div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
 <canvas id="particlesCanvas"></canvas>
 
 <aside class="sidebar" id="sidebar">
@@ -1498,6 +1623,7 @@ if(SpeechRecognition){
   recognition.continuous=false;
   recognition.interimResults=true;
   recognition.lang='fr-FR';
+  recognition.maxAlternatives=1;
 }
 
 function toggleAutoSpeak(){
@@ -1506,9 +1632,20 @@ function toggleAutoSpeak(){
 }
 
 function toggleMic(){
-  if(!recognition){alert('Reconnaissance vocale non supportee.');return;}
+  if(!recognition){alert('Reconnaissance vocale non supportee. Utilisez Chrome ou Edge.');return;}
   if(isRecording){recognition.stop();isRecording=false;document.getElementById('micBtn').classList.remove('recording');}
-  else{synth.cancel();recognition.start();isRecording=true;document.getElementById('micBtn').classList.add('recording');}
+  else{
+    synth.cancel();
+    try{
+      recognition.start();
+      isRecording=true;
+      document.getElementById('micBtn').classList.add('recording');
+    }catch(e){
+      setTimeout(function(){
+        try{recognition.start();isRecording=true;document.getElementById('micBtn').classList.add('recording');}catch(e2){}
+      },100);
+    }
+  }
 }
 
 var voiceMode=false;
@@ -1597,14 +1734,18 @@ function voiceSpeakURL(url,text){
   updateVoiceUI();
   document.getElementById('voiceWaves').classList.add('active');
   voiceAudio=new Audio(url);
+  voiceAudio.preload='auto';
+  voiceAudio.oncanplaythrough=function(){
+    voiceAudio.play().catch(function(){voiceSpeakBrowser(text);});
+  };
   voiceAudio.onended=function(){
     document.getElementById('voiceWaves').classList.remove('active');
-    if(voiceMode){voiceState='idle';updateVoiceUI();setTimeout(function(){startVoiceListen();},500);}
+    if(voiceMode){voiceState='idle';updateVoiceUI();setTimeout(function(){startVoiceListen();},800);}
   };
   voiceAudio.onerror=function(){
     voiceSpeakBrowser(text);
   };
-  voiceAudio.play().catch(function(){voiceSpeakBrowser(text);});
+  setTimeout(function(){voiceAudio.play().catch(function(){voiceSpeakBrowser(text);});},200);
 }
 
 function voiceSpeakBrowser(text){
@@ -1655,7 +1796,7 @@ if(recognition){
   };
 }
 
-function toggleSidebar(){document.getElementById('sidebar').classList.toggle('open');}
+function toggleSidebar(){var s=document.getElementById('sidebar');var o=document.getElementById('sidebarOverlay');s.classList.toggle('open');o.classList.toggle('active');}
 
 function showView(view,el){
   document.querySelectorAll('.menu-item').forEach(function(i){i.classList.remove('active')});
@@ -1783,9 +1924,20 @@ function speakText(text){
   var c=text.replace(/\n/g,' ').replace(/[#\-*>|_\`\[\]]/g,'').replace(/\s+/g,' ').trim();
   if(!c||c.length<2)return;
   synth.cancel();
-  var u=new SpeechSynthesisUtterance(c);
-  u.lang='fr-FR';u.rate=1.0;
-  synth.speak(u);
+  fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({text:c.substring(0,200)})})
+  .then(function(r){if(!r.ok)throw 'fail';return r.blob()})
+  .then(function(blob){
+    var url=URL.createObjectURL(blob);
+    var a=new Audio(url);
+    a.onended=function(){URL.revokeObjectURL(url);};
+    a.play().catch(function(){
+      var u=new SpeechSynthesisUtterance(c);u.lang='fr-FR';u.rate=1.0;synth.speak(u);
+    });
+  })
+  .catch(function(){
+    var u=new SpeechSynthesisUtterance(c);u.lang='fr-FR';u.rate=1.0;synth.speak(u);
+  });
 }
 
 function speakMsg(id){
@@ -2589,13 +2741,18 @@ def chat():
         if t != "general":
             update_memory(lambda mem, topic=t, msg=message: record_knowledge(mem, topic, msg))
 
-    # Web search if needed
+    # Web search if needed - toujours pour les questions factuelles
     web_context = ""
     search_used = False
-    if needs_web_search(message):
+    should_search = needs_web_search(message)
+    if not should_search:
+        question_words = ["qui", "quoi", "ou", "quand", "comment", "pourquoi", "combien", "quel", "quelle", "quels"]
+        if any(message.lower().startswith(w) for w in question_words) and len(message.split()) > 3:
+            should_search = True
+    if should_search:
         results = web_search(message)
         if results:
-            web_context = "\n\nIMPORTANT: Voici les resultats de recherche web. Utilise-les pour repondre:\n"
+            web_context = "\n\nIMPORTANT: Voici les resultats de recherche web. Utilise-les pour repondre de facon precise et actualisee:\n"
             for i, r in enumerate(results, 1):
                 web_context += f"{i}. {r['title']}: {r['snippet']}\n"
             search_used = True
@@ -2810,30 +2967,36 @@ def api_document():
 # =====================================================================
 @app.route("/api/tts", methods=["POST"])
 def api_tts():
-    """Genere un fichier audio MP3 via Edge TTS"""
+    """Genere un fichier audio MP3 via Google Translate TTS (rapide, gratuit)"""
     data = request.get_json(silent=True)
     if not data:
         return Response(b'{"error":"Invalid"}', status=400, content_type="application/json")
     text = data.get("text", "").strip()
-    voice = data.get("voice", "fr-FR-DeniseNeural")
     if not text:
         return Response(b'{"error":"Empty"}', status=400, content_type="application/json")
 
-    try:
-        import asyncio
-        import edge_tts
+    # Limiter a 200 caracteres pour Google Translate
+    if len(text) > 200:
+        text = text[:200]
 
+    try:
         audio_id = hashlib.md5(text.encode()).hexdigest()[:12]
         audio_path = os.path.join(GENERATED_DIR, f"tts_{audio_id}.mp3")
 
         if not os.path.exists(audio_path):
-            async def generate():
-                communicate = edge_tts.Communicate(text, voice)
-                await communicate.save(audio_path)
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(generate())
-            loop.close()
+            from urllib.parse import quote
+            url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={quote(text)}&tl=fr&client=tw-ob"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            r = _requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200 and len(r.content) > 1000:
+                with open(audio_path, "wb") as f:
+                    f.write(r.content)
+            else:
+                return Response(
+                    _json.dumps({"error": "TTS generation failed"}).encode("utf-8"),
+                    status=500,
+                    content_type="application/json"
+                )
 
         return send_file(audio_path, mimetype="audio/mpeg")
     except Exception as e:
@@ -2846,67 +3009,83 @@ def api_tts():
 
 @app.route("/api/voice-chat", methods=["POST"])
 def api_voice_chat():
-    """Chat + TTS en un seul appel - pour l'agent vocal"""
+    """Chat + TTS rapide pour l'agent vocal"""
     data = request.get_json(silent=True)
     if not data:
         return Response(b'{"error":"Invalid"}', status=400, content_type="application/json")
     message = data.get("message", "").strip()
     conv_id = data.get("conversation_id", "default")
-    voice = data.get("voice", "fr-FR-DeniseNeural")
     if not message:
         return Response(b'{"error":"Empty"}', status=400, content_type="application/json")
 
     if conv_id not in conversations:
         conversations[conv_id] = []
-    if len(conversations[conv_id]) > 20:
-        conversations[conv_id] = conversations[conv_id][-10:]
+    if len(conversations[conv_id]) > 10:
+        conversations[conv_id] = conversations[conv_id][-6:]
 
     fast = get_fast_response(message.lower())
     if fast is not None:
         conversations[conv_id].append({"role": "user", "content": message})
         conversations[conv_id].append({"role": "assistant", "content": fast["text"]})
-        ai_text = fast["text"]
+        # Version courte pour le vocal
+        ai_text = fast.get("speak", fast["text"])[:200]
     else:
         conversations[conv_id].append({"role": "user", "content": message})
-        mem = get_memory()
-        mc = ""
-        if mem.get("corrections"):
-            mc += "Corrections passees: " + "; ".join(
-                [c.get("question", "") + " -> " + c.get("correction", "") for c in mem["corrections"][-5:]]
-            )
-        ai_text = chat_ia(message, conversations[conv_id], mc)
+        # Reponse rapide avec moins de tokens pour le vocal
+        system = "Tu es ELLIOTT. Reponds en francais, sois bref et direct (2-3 phrases max). Pas de markdown."
+        messages = [{"role": "system", "content": system}]
+        for msg in conversations[conv_id][-6:]:
+            messages.append(msg)
+        
+        ai_text = None
+        for model in CHAT_MODELS:
+            try:
+                r = _requests.post(
+                    CHAT_API_KILOCODE,
+                    json={"model": model, "messages": messages, "max_tokens": 200, "temperature": 0.7},
+                    timeout=20,
+                )
+                if r.status_code == 200:
+                    data_resp = r.json()
+                    if "choices" in data_resp and data_resp["choices"]:
+                        content = data_resp["choices"][0]["message"]["content"]
+                        if content and len(content.strip()) > 0:
+                            ai_text = content
+                            break
+            except Exception:
+                continue
+        
+        if not ai_text:
+            ai_text = "Je n'ai pas pu comprendre. Peux-tu repeter?"
+        
         conversations[conv_id].append({"role": "assistant", "content": ai_text})
 
     clean_text = ai_text.replace("\n", " ").replace("#", "").replace("*", "").replace("`", "")
     clean_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', clean_text)
-    clean_text = clean_text[:500]
+    clean_text = clean_text[:200]
 
     audio_url = None
     try:
-        import asyncio
-        import edge_tts
-
         audio_id = hashlib.md5(clean_text.encode()).hexdigest()[:12]
         audio_path = os.path.join(GENERATED_DIR, f"tts_{audio_id}.mp3")
 
         if not os.path.exists(audio_path):
-            async def generate():
-                communicate = edge_tts.Communicate(clean_text, voice)
-                await communicate.save(audio_path)
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(generate())
-            loop.close()
+            from urllib.parse import quote
+            url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={quote(clean_text)}&tl=fr&client=tw-ob"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            r = _requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200 and len(r.content) > 1000:
+                with open(audio_path, "wb") as f:
+                    f.write(r.content)
 
-        audio_url = f"/generated/tts_{audio_id}.mp3"
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
+            audio_url = f"/generated/tts_{audio_id}.mp3"
     except Exception as e:
-        print(f"TTS error (fallback to browser): {e}")
-        audio_url = None
+        print(f"TTS error: {e}")
 
     resp = {
         "text": ai_text,
         "audio_url": audio_url,
-        "voice": voice,
     }
     body = _json.dumps(resp, ensure_ascii=False).encode("utf-8")
     return Response(body, content_type="application/json; charset=utf-8")
@@ -2935,4 +3114,4 @@ if __name__ == "__main__":
     print("  Typewriter: Text Animation")
     print("  100% GRATUIT!")
     print("=" * 60)
-    app.run(debug=False, host="127.0.0.1", port=5000, threaded=True)
+    app.run(debug=False, host="0.0.0.0", port=5000, threaded=True)
