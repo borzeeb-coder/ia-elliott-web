@@ -1639,6 +1639,16 @@ var SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
 var startTime=Date.now();
 var pendingFeedback={};
 var msgCount=0;
+var audioCtx=null;
+
+function unlockAudio(){
+  if(!audioCtx){
+    audioCtx=new(window.AudioContext||window.webkitAudioContext)();
+  }
+  if(audioCtx.state==='suspended'){audioCtx.resume();}
+}
+document.addEventListener('touchstart',unlockAudio,{once:true});
+document.addEventListener('click',unlockAudio,{once:true});
 
 if(SpeechRecognition){
   recognition=new SpeechRecognition();
@@ -1755,19 +1765,25 @@ function voiceSpeakURL(url,text){
   voiceState='speaking';
   updateVoiceUI();
   document.getElementById('voiceWaves').classList.add('active');
-  voiceAudio=new Audio(url);
-  voiceAudio.preload='auto';
-  voiceAudio.oncanplaythrough=function(){
-    voiceAudio.play().catch(function(){voiceSpeakBrowser(text);});
-  };
-  voiceAudio.onended=function(){
-    document.getElementById('voiceWaves').classList.remove('active');
-    if(voiceMode){voiceState='idle';updateVoiceUI();setTimeout(function(){startVoiceListen();},800);}
-  };
-  voiceAudio.onerror=function(){
+  fetch(url).then(function(r){return r.blob()}).then(function(blob){
+    var u=URL.createObjectURL(blob);
+    voiceAudio=new Audio(u);
+    voiceAudio.onended=function(){
+      document.getElementById('voiceWaves').classList.remove('active');
+      URL.revokeObjectURL(u);
+      if(voiceMode){voiceState='idle';updateVoiceUI();setTimeout(function(){startVoiceListen();},800);}
+    };
+    voiceAudio.onerror=function(){
+      URL.revokeObjectURL(u);
+      voiceSpeakBrowser(text);
+    };
+    voiceAudio.play().catch(function(){
+      URL.revokeObjectURL(u);
+      voiceSpeakBrowser(text);
+    });
+  }).catch(function(){
     voiceSpeakBrowser(text);
-  };
-  setTimeout(function(){voiceAudio.play().catch(function(){voiceSpeakBrowser(text);});},200);
+  });
 }
 
 function voiceSpeakBrowser(text){
@@ -1943,9 +1959,17 @@ function hideTyping(){var t=document.getElementById('typingMsg');if(t)t.remove()
 
 function playAudioUrl(url){
   if(!url)return;
-  var a=new Audio(url);
-  a.onended=function(){URL.revokeObjectURL(url);};
-  a.play().catch(function(){});
+  fetch(url).then(function(r){return r.blob()}).then(function(blob){
+    var u=URL.createObjectURL(blob);
+    var a=new Audio(u);
+    a.onended=function(){URL.revokeObjectURL(u);setTimeout(function(){setAvatarState('idle');},500);};
+    a.onerror=function(){URL.revokeObjectURL(u);};
+    var p=a.play();
+    if(p&&p.catch)p.catch(function(){
+      unlockAudio();
+      setTimeout(function(){a.play().catch(function(){});},100);
+    });
+  }).catch(function(){});
 }
 
 function speakText(text){
@@ -1955,17 +1979,19 @@ function speakText(text){
   synth.cancel();
   fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({text:c.substring(0,200)})})
-  .then(function(r){if(!r.ok)throw 'fail';return r.blob()})
+  .then(function(r){return r.blob()})
   .then(function(blob){
-    var url=URL.createObjectURL(blob);
-    var a=new Audio(url);
-    a.onended=function(){URL.revokeObjectURL(url);};
-    a.play().catch(function(){
-      var u=new SpeechSynthesisUtterance(c);u.lang='fr-FR';u.rate=1.0;synth.speak(u);
+    var u=URL.createObjectURL(blob);
+    var a=new Audio(u);
+    a.onended=function(){URL.revokeObjectURL(u);};
+    var p=a.play();
+    if(p&&p.catch)p.catch(function(){
+      unlockAudio();
+      setTimeout(function(){a.play().catch(function(){});},100);
     });
   })
   .catch(function(){
-    var u=new SpeechSynthesisUtterance(c);u.lang='fr-FR';u.rate=1.0;synth.speak(u);
+    var s=new SpeechSynthesisUtterance(c);s.lang='fr-FR';s.rate=1.0;synth.speak(s);
   });
 }
 
