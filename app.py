@@ -3341,24 +3341,7 @@ def api_voice_chat():
     clean_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', clean_text)
     clean_text = clean_text[:200]
 
-    audio_url = None
-    try:
-        audio_id = hashlib.md5(clean_text.encode()).hexdigest()[:12]
-        audio_path = os.path.join(GENERATED_DIR, f"tts_{audio_id}.mp3")
-
-        if not os.path.exists(audio_path):
-            from urllib.parse import quote
-            url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={quote(clean_text)}&tl=fr&client=tw-ob"
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            r = _requests.get(url, headers=headers, timeout=10)
-            if r.status_code == 200 and len(r.content) > 1000:
-                with open(audio_path, "wb") as f:
-                    f.write(r.content)
-
-        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
-            audio_url = f"/generated/tts_{audio_id}.mp3"
-    except Exception as e:
-        print(f"TTS error: {e}")
+    audio_url = _generate_tts(clean_text)
 
     resp = {
         "text": ai_text,
