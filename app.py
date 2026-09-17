@@ -1675,19 +1675,16 @@ function toggleAutoSpeak(){
 }
 
 function toggleMic(){
-  if(!recognition){alert('Reconnaissance vocale non supportee. Utilisez Chrome ou Edge.');return;}
-  if(isRecording){recognition.stop();isRecording=false;document.getElementById('micBtn').classList.remove('recording');}
-  else{
+  if(!recognition){alert('Non supporte');return;}
+  if(isRecording){
+    recognition.stop();
+    isRecording=false;
+  }else{
+    var unlock=new SpeechSynthesisUtterance('');
+    window.speechSynthesis.speak(unlock);
     synth.cancel();
-    try{
-      recognition.start();
-      isRecording=true;
-      document.getElementById('micBtn').classList.add('recording');
-    }catch(e){
-      setTimeout(function(){
-        try{recognition.start();isRecording=true;document.getElementById('micBtn').classList.add('recording');}catch(e2){}
-      },100);
-    }
+    recognition.start();
+    isRecording=true;
   }
 }
 
@@ -1731,13 +1728,16 @@ function onVoiceCircleClick(){
 }
 
 function startVoiceListen(){
-  if(!recognition){alert('Reconnaissance vocale non supportee. Utilisez Chrome ou Edge.');return;}
+  if(!recognition){alert('Non supporte');return;}
   synth.cancel();
   if(voiceAudio){voiceAudio.pause();voiceAudio=null;}
   voiceState='listening';
   updateVoiceUI();
   document.getElementById('voiceText').textContent='...';
   document.getElementById('voiceWaves').classList.remove('active');
+  var unlock=new SpeechSynthesisUtterance('');
+  window.speechSynthesis.speak(unlock);
+  synth.cancel();
   try{recognition.start();isRecording=true;}catch(e){}
 }
 
