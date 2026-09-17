@@ -40,6 +40,10 @@ CHAT_MODELS = [
     "nex-agi/nex-n2.5-pro:free",
 ]
 
+ELEVENLABS_API_KEY = "sk_ebdfe7ccd50e699274a4d84fa9d495e77128e18442ebe9c8"
+ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"
+ELEVENLABS_MODEL = "eleven_multilingual_v2"
+
 # =====================================================================
 #  WEB SEARCH (Bing + GoogleNews RSS + Wikipedia)
 # =====================================================================
@@ -1646,7 +1650,21 @@ function parler(texte){
   window.speechSynthesis.cancel();
   var c=texte.replace(/\n/g,' ').replace(/[#\-*>|_`\[\]]/g,'').replace(/\s+/g,' ').trim();
   if(!c||c.length<2)return;
-  currentUtterance=new SpeechSynthesisUtterance(c);
+  fetch('/api/elevenlabs-tts',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({text:c.substring(0,500)})})
+  .then(function(r){if(!r.ok)throw 'fail';return r.blob()})
+  .then(function(blob){
+    var u=URL.createObjectURL(blob);
+    var a=new Audio(u);
+    a.onended=function(){URL.revokeObjectURL(u);};
+    a.onerror=function(){URL.revokeObjectURL(u);fallbackSpeak(c);};
+    a.play().catch(function(){URL.revokeObjectURL(u);fallbackSpeak(c);});
+  })
+  .catch(function(){fallbackSpeak(c);});
+}
+
+function fallbackSpeak(text){
+  currentUtterance=new SpeechSynthesisUtterance(text);
   currentUtterance.lang='fr-FR';currentUtterance.rate=0.95;currentUtterance.pitch=1.0;
   var voix=window.speechSynthesis.getVoices();
   var v=voix.find(function(x){return x.lang&&x.lang.startsWith('fr')&&(x.name.indexOf('Siri')!==-1||x.name.indexOf('Thomas')!==-1||x.name.indexOf('Premium')!==-1);})
@@ -1806,17 +1824,38 @@ function voiceSpeakBrowser(text){
   window.speechSynthesis.cancel();
   var c=text.replace(/\n/g,' ').replace(/[#\-*>|_`\[\]]/g,'').replace(/\s+/g,' ').trim();
   if(!c||c.length<2)return;
-  currentUtterance=new SpeechSynthesisUtterance(c);
-  currentUtterance.lang='fr-FR';currentUtterance.rate=0.95;currentUtterance.pitch=1.0;
+  fetch('/api/elevenlabs-tts',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({text:c.substring(0,500)})})
+  .then(function(r){if(!r.ok)throw 'fail';return r.blob()})
+  .then(function(blob){
+    var u=URL.createObjectURL(blob);
+    var a=new Audio(u);
+    a.onended=function(){
+      URL.revokeObjectURL(u);
+      document.getElementById('voiceWaves').classList.remove('active');
+      if(voiceMode){voiceState='idle';updateVoiceUI();setTimeout(function(){startVoiceListen();},800);}
+    };
+    a.onerror=function(){
+      URL.revokeObjectURL(u);
+      voiceFallbackBrowser(c);
+    };
+    a.play().catch(function(){URL.revokeObjectURL(u);voiceFallbackBrowser(c);});
+  }).catch(function(){voiceFallbackBrowser(c);});
+}
+
+function voiceFallbackBrowser(text){
+  window.speechSynthesis.cancel();
+  var u=new SpeechSynthesisUtterance(text);
+  u.lang='fr-FR';u.rate=0.95;u.pitch=1.0;
   var voix=window.speechSynthesis.getVoices();
   var v=voix.find(function(x){return x.lang&&x.lang.startsWith('fr')&&(x.name.indexOf('Siri')!==-1||x.name.indexOf('Thomas')!==-1||x.name.indexOf('Premium')!==-1);})
     ||voix.find(function(x){return x.lang&&x.lang.startsWith('fr');});
-  if(v)currentUtterance.voice=v;
-  currentUtterance.onend=function(){
+  if(v)u.voice=v;
+  u.onend=function(){
     document.getElementById('voiceWaves').classList.remove('active');
     if(voiceMode){voiceState='idle';updateVoiceUI();setTimeout(function(){startVoiceListen();},800);}
   };
-  window.speechSynthesis.speak(currentUtterance);
+  window.speechSynthesis.speak(u);
 }
 
 if(recognition){
@@ -3056,6 +3095,58 @@ def api_tts():
             else:
                 return Response(
                     _json.dumps({"error": "TTS generation failed"}).encode("utf-8"),
+                    status=500,
+                    content_type="application/json"
+                )
+
+        return send_file(audio_path, mimetype="audio/mpeg")
+    except Exception as e:
+        return Response(
+            _json.dumps({"error": str(e)}).encode("utf-8"),
+            status=500,
+            content_type="application/json"
+        )
+
+
+@app.route("/api/elevenlabs-tts", methods=["POST"])
+def api_elevenlabs_tts():
+    """Genere un fichier audio MP3 via ElevenLabs (haute qualite)"""
+    data = request.get_json(silent=True)
+    if not data:
+        return Response(b'{"error":"Invalid"}', status=400, content_type="application/json")
+    text = data.get("text", "").strip()
+    if not text:
+        return Response(b'{"error":"Empty"}', status=400, content_type="application/json")
+    if len(text) > 500:
+        text = text[:500]
+
+    try:
+        audio_id = hashlib.md5(text.encode()).hexdigest()[:12]
+        audio_path = os.path.join(GENERATED_DIR, f"el_{audio_id}.mp3")
+
+        if not os.path.exists(audio_path):
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+            headers = {
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json",
+            }
+            body = {
+                "text": text,
+                "model_id": ELEVENLABS_MODEL,
+                "voice_settings": {
+                    "stability": 0.5,
+                    "similarity_boost": 0.75,
+                    "style": 0.5,
+                    "use_speaker_boost": True,
+                },
+            }
+            r = _requests.post(url, json=body, headers=headers, timeout=30)
+            if r.status_code == 200 and len(r.content) > 1000:
+                with open(audio_path, "wb") as f:
+                    f.write(r.content)
+            else:
+                return Response(
+                    _json.dumps({"error": "ElevenLabs TTS failed"}).encode("utf-8"),
                     status=500,
                     content_type="application/json"
                 )
