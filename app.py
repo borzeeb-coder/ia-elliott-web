@@ -1651,13 +1651,22 @@ if(synth.onvoiceschanged!==undefined){synth.onvoiceschanged=loadVoices;}
 
 function parler(texte){
   if(!texte)return;
-  synth.cancel();
+  window.speechSynthesis.cancel();
   var c=texte.replace(/\n/g,' ').replace(/[#\-*>|_\`\[\]]/g,'').replace(/\s+/g,' ').trim();
   if(!c||c.length<2)return;
   var u=new SpeechSynthesisUtterance(c);
-  u.lang='fr-FR';u.rate=1.0;u.pitch=1.0;
-  if(frenchVoice)u.voice=frenchVoice;
-  synth.speak(u);
+  u.lang='fr-FR';u.rate=0.95;u.pitch=1.0;
+  var voix=window.speechSynthesis.getVoices();
+  var v=voix.find(function(x){return x.lang&&x.lang.startsWith('fr')&&(x.name.indexOf('Siri')!==-1||x.name.indexOf('Thomas')!==-1||x.name.indexOf('Premium')!==-1);})
+    ||voix.find(function(x){return x.lang&&x.lang.startsWith('fr');});
+  if(v)u.voice=v;
+  setTimeout(function(){window.speechSynthesis.speak(u);},100);
+}
+
+document.addEventListener('touchstart',function(){window.speechSynthesis.getVoices();},{passive:true});
+window.speechSynthesis.getVoices();
+if(window.speechSynthesis.onvoiceschanged!==undefined){
+  window.speechSynthesis.onvoiceschanged=function(){window.speechSynthesis.getVoices();};
 }
 
 if(SpeechRecognition){
@@ -1802,15 +1811,19 @@ function voiceSpeakBrowser(text){
   voiceState='speaking';
   updateVoiceUI();
   document.getElementById('voiceWaves').classList.add('active');
+  window.speechSynthesis.cancel();
   var c=text.replace(/\n/g,' ').replace(/[#\-*>|_\`\[\]]/g,'').replace(/\s+/g,' ').trim();
   var u=new SpeechSynthesisUtterance(c);
-  u.lang='fr-FR';u.rate=1.0;u.pitch=1.0;
-  if(frenchVoice)u.voice=frenchVoice;
+  u.lang='fr-FR';u.rate=0.95;u.pitch=1.0;
+  var voix=window.speechSynthesis.getVoices();
+  var v=voix.find(function(x){return x.lang&&x.lang.startsWith('fr')&&(x.name.indexOf('Siri')!==-1||x.name.indexOf('Thomas')!==-1||x.name.indexOf('Premium')!==-1);})
+    ||voix.find(function(x){return x.lang&&x.lang.startsWith('fr');});
+  if(v)u.voice=v;
   u.onend=function(){
     document.getElementById('voiceWaves').classList.remove('active');
     if(voiceMode){voiceState='idle';updateVoiceUI();setTimeout(function(){startVoiceListen();},800);}
   };
-  synth.speak(u);
+  setTimeout(function(){window.speechSynthesis.speak(u);},100);
 }
 
 if(recognition){
