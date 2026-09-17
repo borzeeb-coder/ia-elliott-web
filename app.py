@@ -39,6 +39,7 @@ CHAT_MODELS = [
     "kilo-auto/free",
     "nex-agi/nex-n2.5-pro:free",
 ]
+CHAT_TIMEOUT = 25
 
 ELEVENLABS_API_KEY = "sk_ebdfe7ccd50e699274a4d84fa9d495e77128e18442ebe9c8"
 ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"
@@ -585,16 +586,26 @@ def execute_python_code(code, timeout=10):
 # =====================================================================
 #  CHAT API
 # =====================================================================
-def chat_ia(message, history, memory_context="", web_context=""):
-    system = (
-        "Tu es ELLIOTT, un assistant IA super intelligent, polyvalent et serviable. "
-        "Tu reponds toujours en francais. Tu es expert en: programmation, technologie, "
-        "sciences, art, musique, creation, artisanat, cuisine, et bien plus. "
-        "Tu peux: coder, expliquer, creer, ecrire, traduire, analyser, conseiller. "
-        "Tu es creatif, precis et amical. Tu reponds en markdown avec du code formate. "
-        "Tu t'adaptes au style de l'utilisateur. "
-        "Quand tu recois des resultats de recherche web, integre-les dans ta reponse de facon naturelle et utile."
-    )
+def chat_ia(message, history, memory_context="", web_context="", voice_mode=False):
+    if voice_mode:
+        system = (
+            "Tu es ELLIOTT, un assistant IA vocal intelligent et conversationnel. "
+            "Tu reponds toujours en francais. Tu parles comme un ami intelligent, pas comme un robot. "
+            "IMPORTANT: Quand on te parle a voix, reponds de facon COURTE et NATURELLE (1-3 phrases). "
+            "Jamais de markdown, pas de listes a puces, pas de codes. "
+            "Sois chaleureux, direct, et utile. Tu peux: expliquer, conseiller, raconter, rechercher. "
+            "Tu t'adaptes a l'humeur de l'utilisateur. Sois precis mais concis."
+        )
+    else:
+        system = (
+            "Tu es ELLIOTT, un assistant IA super intelligent, polyvalent et serviable. "
+            "Tu reponds toujours en francais. Tu es expert en: programmation, technologie, "
+            "sciences, art, musique, creation, artisanat, cuisine, et bien plus. "
+            "Tu peux: coder, expliquer, creer, ecrire, traduire, analyser, conseiller. "
+            "Tu es creatif, precis et amical. Tu reponds en markdown avec du code formate. "
+            "Tu t'adaptes au style de l'utilisateur. "
+            "Quand tu recois des resultats de recherche web, integre-les dans ta reponse de facon naturelle et utile."
+        )
     if memory_context:
         system += f"\n\nContexte memoire (souviens-toi de ceci pour repondre mieux):\n{memory_context}"
     if web_context:
@@ -605,12 +616,14 @@ def chat_ia(message, history, memory_context="", web_context=""):
         messages.append(msg)
     messages.append({"role": "user", "content": message})
 
+    max_tok = 200 if voice_mode else 1024
+
     for model in CHAT_MODELS:
         try:
             r = _requests.post(
                 CHAT_API_KILOCODE,
-                json={"model": model, "messages": messages, "max_tokens": 1024, "temperature": 0.7},
-                timeout=60,
+                json={"model": model, "messages": messages, "max_tokens": max_tok, "temperature": 0.7},
+                timeout=CHAT_TIMEOUT,
             )
             if r.status_code == 200:
                 data = r.json()
@@ -1015,14 +1028,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 *{margin:0;padding:0;box-sizing:border-box}
 body{padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
 :root{
-  --bg:#06060a;--bgc:#0f0f15;--bgh:#1a1a24;--bd:#1e1e2e;
-  --tx:#e8e8f0;--txd:#6b6b80;--txdd:#4a4a5e;
-  --ac:#6366f1;--ach:#818cf8;--acg:rgba(99,102,241,.15);
-  --bl:#3b82f6;--gn:#22c55e;--rd:#ef4444;--pp:#a855f7;
-  --or:#f97316;--cy:#06b6d4;
+  --bg:#08080f;--bgc:#111118;--bgh:#1c1c2a;--bd:#252538;
+  --tx:#eeeef5;--txd:#7b7b95;--txdd:#55556e;
+  --ac:#7c5cfc;--ach:#9f7fff;--acg:rgba(124,92,252,.15);
+  --bl:#3b82f6;--gn:#22c55e;--rd:#ef4444;--pp:#c084fc;
+  --or:#f59e0b;--cy:#06b6d4;
   --r:12px;--r2:16px;
-  --glow:0 0 20px rgba(99,102,241,.3);
-  --glow-sm:0 0 10px rgba(99,102,241,.2);
+  --glow:0 0 24px rgba(124,92,252,.35);
+  --glow-sm:0 0 12px rgba(124,92,252,.2);
 }
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;display:flex;overflow:hidden}
 ::selection{background:var(--ac);color:#fff}
@@ -3180,37 +3193,19 @@ def api_voice_chat():
     if fast is not None:
         conversations[conv_id].append({"role": "user", "content": message})
         conversations[conv_id].append({"role": "assistant", "content": fast["text"]})
-        # Version courte pour le vocal
         ai_text = fast.get("speak", fast["text"])[:200]
     else:
         conversations[conv_id].append({"role": "user", "content": message})
-        # Reponse rapide avec moins de tokens pour le vocal
-        system = "Tu es ELLIOTT. Reponds en francais, sois bref et direct (2-3 phrases max). Pas de markdown."
-        messages = [{"role": "system", "content": system}]
-        for msg in conversations[conv_id][-6:]:
-            messages.append(msg)
-        
-        ai_text = None
-        for model in CHAT_MODELS:
-            try:
-                r = _requests.post(
-                    CHAT_API_KILOCODE,
-                    json={"model": model, "messages": messages, "max_tokens": 200, "temperature": 0.7},
-                    timeout=20,
-                )
-                if r.status_code == 200:
-                    data_resp = r.json()
-                    if "choices" in data_resp and data_resp["choices"]:
-                        content = data_resp["choices"][0]["message"]["content"]
-                        if content and len(content.strip()) > 0:
-                            ai_text = content
-                            break
-            except Exception:
-                continue
-        
-        if not ai_text:
-            ai_text = "Je n'ai pas pu comprendre. Peux-tu repeter?"
-        
+        m = get_memory()
+        memory_context = find_relevant_memory(m, message)
+        web_context = ""
+        if needs_web_search(message):
+            results = web_search(message)
+            if results:
+                web_context = "\n\nResultats de recherche:\n"
+                for i, r in enumerate(results, 1):
+                    web_context += f"{i}. {r['title']}: {r['snippet']}\n"
+        ai_text = chat_ia(message, conversations[conv_id], memory_context, web_context, voice_mode=True)
         conversations[conv_id].append({"role": "assistant", "content": ai_text})
 
     clean_text = ai_text.replace("\n", " ").replace("#", "").replace("*", "").replace("`", "")
