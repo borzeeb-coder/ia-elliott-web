@@ -1871,17 +1871,22 @@ function playPhrasesSequentially(phrases, index){
     if(d.audio_url){
       voiceState='speaking';
       updateVoiceUI();
-      fetch(d.audio_url).then(function(r){return r.blob()}).then(function(blob){
-        var u=URL.createObjectURL(blob);
-        var audio=new Audio(u);
-        document.getElementById('voiceWaves').classList.add('active');
-        parlser=phrase;
-        audio.onended=function(){
-          URL.revokeObjectURL(u);
-          document.getElementById('voiceWaves').classList.remove('active');
-          playPhrasesSequentially(phrases, index+1);
-        };
-        audio.play();
+      var audio=new Audio(d.audio_url);
+      document.getElementById('voiceWaves').classList.add('active');
+      parlser=phrase;
+      audio.onended=function(){
+        document.getElementById('voiceWaves').classList.remove('active');
+        playPhrasesSequentially(phrases, index+1);
+      };
+      audio.onerror=function(){
+        document.getElementById('voiceWaves').classList.remove('active');
+        voiceSpeakBrowser(phrase);
+        playPhrasesSequentially(phrases, index+1);
+      };
+      audio.play().catch(function(){
+        document.getElementById('voiceWaves').classList.remove('active');
+        voiceSpeakBrowser(phrase);
+        playPhrasesSequentially(phrases, index+1);
       });
     } else {
       voiceSpeakBrowser(phrase);
