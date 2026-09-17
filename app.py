@@ -632,6 +632,28 @@ def generate_image(prompt):
         return None
 
 
+def _generate_tts(text):
+    try:
+        clean = text.replace("\n", " ").replace("#", "").replace("*", "").replace("`", "")
+        clean = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', clean)[:200]
+        if len(clean) < 2:
+            return None
+        audio_id = hashlib.md5(clean.encode()).hexdigest()[:12]
+        audio_path = os.path.join(GENERATED_DIR, f"tts_{audio_id}.mp3")
+        if not os.path.exists(audio_path):
+            url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={quote(clean)}&tl=fr&client=tw-ob"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            r = _requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200 and len(r.content) > 1000:
+                with open(audio_path, "wb") as f:
+                    f.write(r.content)
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
+            return f"/generated/tts_{audio_id}.mp3"
+    except Exception as e:
+        print(f"TTS gen error: {e}")
+    return None
+
+
 # =====================================================================
 #  FAST RESPONSES
 # =====================================================================
@@ -1919,6 +1941,13 @@ function showTyping(t){
 
 function hideTyping(){var t=document.getElementById('typingMsg');if(t)t.remove();}
 
+function playAudioUrl(url){
+  if(!url)return;
+  var a=new Audio(url);
+  a.onended=function(){URL.revokeObjectURL(url);};
+  a.play().catch(function(){});
+}
+
 function speakText(text){
   if(!text)return;
   var c=text.replace(/\n/g,' ').replace(/[#\-*>|_\`\[\]]/g,'').replace(/\s+/g,' ').trim();
@@ -2028,7 +2057,11 @@ function sendMessage(){
       setAvatarState('speaking');
       addMessageWithTypewriter(d.text||'Pas de reponse',false,{confidence:conf,searchUsed:d.search_used});
       if(autoSpeak&&d.text){
-        speakText(d.text);
+        if(d.audio_url){
+          playAudioUrl(d.audio_url);
+        }else{
+          speakText(d.text);
+        }
       }
       setTimeout(function(){if(window.elliottParticles)window.elliottParticles.setSpeaking(false);},3000);
     }
@@ -2688,6 +2721,8 @@ def chat():
         resp = dict(fast)
         resp["fromAI"] = False
         resp["confidence"] = 1.0
+        speak_text = fast.get("speak", fast["text"])[:200]
+        resp["audio_url"] = _generate_tts(speak_text)
         body = _json.dumps(resp, ensure_ascii=False).encode("utf-8")
         return Response(body, content_type="application/json; charset=utf-8")
 
@@ -2803,6 +2838,7 @@ def chat():
         "confidence": confidence,
         "fromAI": True,
         "search_used": search_used,
+        "audio_url": _generate_tts(ai_response),
     }
     body = _json.dumps(resp, ensure_ascii=False).encode("utf-8")
     return Response(body, content_type="application/json; charset=utf-8")
