@@ -37,6 +37,7 @@ GENERATED_DIR = os.path.join(BASE_DIR, "generated")
 os.makedirs(GENERATED_DIR, exist_ok=True)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GOOGLE_AI_API_KEY = os.environ.get("GOOGLE_AI_API_KEY", "")
 CHAT_API_GROQ = "https://api.groq.com/openai/v1/chat/completions"
 CHAT_API_KILOCODE = "https://api.kilo.ai/api/gateway/v1/chat/completions"
 CHAT_MODELS_GROQ = ["llama-3.3-70b-versatile"]
@@ -629,6 +630,25 @@ def chat_ia(message, history, memory_context="", web_context="", voice_mode=Fals
     messages.append({"role": "user", "content": message})
 
     max_tok = 200 if voice_mode else 1024
+
+    if GOOGLE_AI_API_KEY:
+        try:
+            contents = []
+            for msg in messages:
+                role = "user" if msg["role"] == "user" else "model"
+                contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+            r = _requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GOOGLE_AI_API_KEY}",
+                json={"contents": contents, "generationConfig": {"maxOutputTokens": max_tok, "temperature": 0.7}},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                content = data["candidates"][0]["content"]["parts"][0]["text"]
+                if content and len(content.strip()) > 0:
+                    return content
+        except Exception as e:
+            print(f"Google AI error: {e}")
 
     if GROQ_API_KEY:
         try:
