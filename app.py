@@ -20,6 +20,8 @@ from io import BytesIO
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from urllib.parse import quote
+from dotenv import load_dotenv
+load_dotenv()
 
 import matplotlib
 matplotlib.use('Agg')
@@ -41,7 +43,7 @@ CHAT_MODELS = [
 ]
 CHAT_TIMEOUT = 25
 
-ELEVENLABS_API_KEY = "sk_ebdfe7ccd50e699274a4d84fa9d495e77128e18442ebe9c8"
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"
 ELEVENLABS_MODEL = "eleven_multilingual_v2"
 
@@ -652,20 +654,48 @@ def generate_image(prompt):
 def _generate_tts(text):
     try:
         clean = text.replace("\n", " ").replace("#", "").replace("*", "").replace("`", "")
-        clean = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', clean)[:200]
+        clean = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', clean)[:500]
         if len(clean) < 2:
             return None
+
         audio_id = hashlib.md5(clean.encode()).hexdigest()[:12]
-        audio_path = os.path.join(GENERATED_DIR, f"tts_{audio_id}.mp3")
-        if not os.path.exists(audio_path):
-            url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={quote(clean)}&tl=fr&client=tw-ob"
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            r = _requests.get(url, headers=headers, timeout=10)
-            if r.status_code == 200 and len(r.content) > 1000:
-                with open(audio_path, "wb") as f:
-                    f.write(r.content)
-        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
+        audio_path = os.path.join(GENERATED_DIR, f"el_{audio_id}.mp3")
+
+        if os.path.exists(audio_path):
+            return f"/generated/el_{audio_id}.mp3"
+
+        if ELEVENLABS_API_KEY:
+            try:
+                url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+                headers = {
+                    "xi-api-key": ELEVENLABS_API_KEY,
+                    "Content-Type": "application/json",
+                    "Accept": "audio/mpeg",
+                }
+                payload = {
+                    "text": clean,
+                    "model_id": ELEVENLABS_MODEL,
+                    "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+                }
+                r = _requests.post(url, json=payload, headers=headers, timeout=20)
+                if r.status_code == 200 and len(r.content) > 1000:
+                    with open(audio_path, "wb") as f:
+                        f.write(r.content)
+                    return f"/generated/el_{audio_id}.mp3"
+                else:
+                    print(f"ElevenLabs error {r.status_code}: {r.text[:300]}")
+            except Exception as e:
+                print(f"ElevenLabs error: {e}")
+
+        fallback_path = os.path.join(GENERATED_DIR, f"tts_{audio_id}.mp3")
+        gurl = f"https://translate.google.com/translate_tts?ie=UTF-8&q={quote(clean)}&tl=fr&client=tw-ob"
+        gheaders = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        r2 = _requests.get(gurl, headers=gheaders, timeout=10)
+        if r2.status_code == 200 and len(r2.content) > 1000:
+            with open(fallback_path, "wb") as f:
+                f.write(r2.content)
             return f"/generated/tts_{audio_id}.mp3"
+
     except Exception as e:
         print(f"TTS gen error: {e}")
     return None
