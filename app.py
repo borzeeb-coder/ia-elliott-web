@@ -36,7 +36,10 @@ MEMORY_FILE = os.path.join(BASE_DIR, "memory.json")
 GENERATED_DIR = os.path.join(BASE_DIR, "generated")
 os.makedirs(GENERATED_DIR, exist_ok=True)
 
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+CHAT_API_GROQ = "https://api.groq.com/openai/v1/chat/completions"
 CHAT_API_KILOCODE = "https://api.kilo.ai/api/gateway/v1/chat/completions"
+CHAT_MODELS_GROQ = ["llama-3.3-70b-versatile"]
 CHAT_MODELS = [
     "kilo-auto/free",
     "nex-agi/nex-n2.5-pro:free",
@@ -142,13 +145,9 @@ def web_search(query, num_results=5):
 
 def needs_web_search(message):
     search_keywords = [
-        "actualit", "nouveau", "recent", "prix", "cours",
-        "meteo", "aujourd'hui", "2024", "2025", "2026", "2027",
-        "dernier", "derniere", "meilleur", "compar",
-        "championnat", "election", "bourse", "cotation",
-        "qu'est-ce qui", "que se passe", "info", "nouvelle",
-        "derniere actu", "monde", "france", "international",
-        "sport", "football", " rugby", "tennis",
+        "actualite", "aujourd'hui", "cette semaine", "ce mois",
+        "meteo", "cours de", "prix actuel", "derniere nouvelle",
+        "qui a gagne", "resultat", "2026", "2027",
     ]
     msg_lower = message.lower()
     return any(kw in msg_lower for kw in search_keywords)
@@ -192,7 +191,14 @@ def _default_memory():
     }
 
 
+_memory_cache = None
+_memory_dirty = False
+
+
 def load_memory():
+    global _memory_cache
+    if _memory_cache is not None:
+        return _memory_cache
     try:
         if os.path.exists(MEMORY_FILE):
             with open(MEMORY_FILE, "r", encoding="utf-8") as f:
@@ -200,19 +206,23 @@ def load_memory():
             for k, v in _default_memory().items():
                 if k not in m:
                     m[k] = v
+            _memory_cache = m
             return m
     except Exception:
         pass
-    return _default_memory()
+    _memory_cache = _default_memory()
+    return _memory_cache
 
 
 def save_memory(m):
-    try:
-        with memory_lock:
+    global _memory_cache, _memory_dirty
+    _memory_cache = m
+    with memory_lock:
+        try:
             with open(MEMORY_FILE, "w", encoding="utf-8") as f:
                 _json.dump(m, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Memory save error: {e}")
+        except Exception as e:
+            print(f"Memory save error: {e}")
 
 
 def get_memory():
@@ -619,6 +629,22 @@ def chat_ia(message, history, memory_context="", web_context="", voice_mode=Fals
     messages.append({"role": "user", "content": message})
 
     max_tok = 200 if voice_mode else 1024
+
+    if GROQ_API_KEY:
+        try:
+            r = _requests.post(
+                CHAT_API_GROQ,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                json={"model": CHAT_MODELS_GROQ[0], "messages": messages, "max_tokens": max_tok, "temperature": 0.7},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                content = data["choices"][0]["message"]["content"]
+                if content and len(content.strip()) > 0:
+                    return content
+        except Exception as e:
+            print(f"Groq error: {e}")
 
     for model in CHAT_MODELS:
         try:
@@ -1821,15 +1847,50 @@ function voiceSend(text){
   .then(function(r){return r.json()})
   .then(function(d){
     document.getElementById('voiceText').textContent=d.text||'';
-    if(d.audio_url){
-      voiceSpeakURL(d.audio_url,d.text);
-    }else{
-      voiceSpeakBrowser(d.text);
-    }
+    var phrases = d.text.match(/[^.!?]+[.!?]+/g) || [d.text];
+    playPhrasesSequentially(phrases, 0);
   })
   .catch(function(){
     voiceState='idle';
     updateVoiceUI();
+  });
+}
+
+function playPhrasesSequentially(phrases, index){
+  if(index >= phrases.length){
+    voiceState='idle';
+    updateVoiceUI();
+    return;
+  }
+  var phrase = phrases[index].trim();
+  if(!phrase){ playPhrasesSequentially(phrases, index+1); return; }
+  fetch('/api/tts-only',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({text:phrase})})
+  .then(function(r){return r.json()})
+  .then(function(d){
+    if(d.audio_url){
+      voiceState='speaking';
+      updateVoiceUI();
+      fetch(d.audio_url).then(function(r){return r.blob()}).then(function(blob){
+        var u=URL.createObjectURL(blob);
+        var audio=new Audio(u);
+        document.getElementById('voiceWaves').classList.add('active');
+        parlser=phrase;
+        audio.onended=function(){
+          URL.revokeObjectURL(u);
+          document.getElementById('voiceWaves').classList.remove('active');
+          playPhrasesSequentially(phrases, index+1);
+        };
+        audio.play();
+      });
+    } else {
+      voiceSpeakBrowser(phrase);
+      playPhrasesSequentially(phrases, index+1);
+    }
+  })
+  .catch(function(){
+    voiceSpeakBrowser(phrase);
+    playPhrasesSequentially(phrases, index+1);
   });
 }
 
@@ -3201,6 +3262,19 @@ def api_elevenlabs_tts():
             status=500,
             content_type="application/json"
         )
+
+
+@app.route("/api/tts-only", methods=["POST"])
+def tts_only():
+    """TTS rapide pour le streaming vocal phrase par phrase"""
+    data = request.get_json(silent=True)
+    if not data:
+        return _json.dumps({"audio_url": None})
+    text = data.get("text", "").strip()
+    if not text:
+        return _json.dumps({"audio_url": None})
+    audio_url = _generate_tts(text)
+    return _json.dumps({"audio_url": audio_url})
 
 
 @app.route("/api/voice-chat", methods=["POST"])
